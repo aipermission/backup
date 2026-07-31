@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -27,14 +28,15 @@ var (
 	identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
 
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 type Store struct {
-	db      *sql.DB
-	dataDir string
-	blobDir string
-	tempDir string
-	now     func() time.Time
+	db         *sql.DB
+	dataDir    string
+	blobDir    string
+	tempDir    string
+	now        func() time.Time
+	mutationMu sync.Mutex
 }
 
 type Backup struct {
@@ -61,6 +63,12 @@ type Stream struct {
 type Page[T any] struct {
 	Items      []T    `json:"items"`
 	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+type PruneResult struct {
+	StreamID     string `json:"stream_id"`
+	KeepLatest   int    `json:"keep_latest"`
+	DeletedCount int    `json:"deleted_count"`
 }
 
 func Open(dataDir string) (*Store, error) {
@@ -133,14 +141,21 @@ CREATE TABLE IF NOT EXISTS backups (
 );
 CREATE INDEX IF NOT EXISTS idx_backups_stream_created
   ON backups(stream_id, created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS pending_blob_deletions (
+  storage_path TEXT PRIMARY KEY,
+  queued_at TEXT NOT NULL
+);
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("initialize metadata database: %w", err)
 	}
-	if schemaVersion == 0 {
-		if _, err := s.db.ExecContext(ctx, `PRAGMA user_version = 1`); err != nil {
+	if schemaVersion < SchemaVersion {
+		if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
 			return fmt.Errorf("write metadata schema version: %w", err)
 		}
+	}
+	if err := s.cleanupPendingDeletions(ctx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -161,9 +176,56 @@ func (s *Store) cleanupTemporary() error {
 	return nil
 }
 
+func (s *Store) cleanupPendingDeletions(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT storage_path FROM pending_blob_deletions ORDER BY queued_at, storage_path`)
+	if err != nil {
+		return fmt.Errorf("list pending backup deletions: %w", err)
+	}
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan pending backup deletion: %w", err)
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate pending backup deletions: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close pending backup deletions: %w", err)
+	}
+	for _, storedPath := range paths {
+		path, err := s.resolveStoragePath(storedPath)
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove pruned backup blob: %w", err)
+		}
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM pending_blob_deletions WHERE storage_path = ?`, storedPath); err != nil {
+			return fmt.Errorf("complete backup blob deletion: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) resolveStoragePath(storedPath string) (string, error) {
+	path := filepath.Join(s.dataDir, filepath.Clean(storedPath))
+	relative, err := filepath.Rel(s.dataDir, path)
+	if err != nil || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || relative == ".." {
+		return "", errors.New("stored backup path escapes data directory")
+	}
+	return path, nil
+}
+
 func ValidateIdentifier(value string) bool { return identifierPattern.MatchString(value) }
 
 func (s *Store) CreateBackup(ctx context.Context, streamID, databaseName, sourceInstallationID string, body io.Reader) (Backup, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	if !ValidateIdentifier(streamID) || !ValidateIdentifier(sourceInstallationID) {
 		return Backup{}, fmt.Errorf("%w: stream or source installation identifier is invalid", ErrInvalidInput)
 	}
@@ -384,10 +446,9 @@ WHERE b.stream_id = ? AND b.id = ?`, streamID, backupID).Scan(
 	if err != nil {
 		return Backup{}, nil, fmt.Errorf("read backup metadata: %w", err)
 	}
-	path := filepath.Join(s.dataDir, filepath.Clean(item.storagePath))
-	relative, err := filepath.Rel(s.dataDir, path)
-	if err != nil || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || relative == ".." {
-		return Backup{}, nil, errors.New("stored backup path escapes data directory")
+	path, err := s.resolveStoragePath(item.storagePath)
+	if err != nil {
+		return Backup{}, nil, err
 	}
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -411,6 +472,82 @@ WHERE b.stream_id = ? AND b.id = ?`, streamID, backupID).Scan(
 		return Backup{}, nil, fmt.Errorf("rewind stored backup: %w", err)
 	}
 	return item, file, nil
+}
+
+func (s *Store) PruneBackups(ctx context.Context, streamID string, keepLatest int) (PruneResult, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if !ValidateIdentifier(streamID) || keepLatest < 1 || keepLatest > 1000 {
+		return PruneResult{}, fmt.Errorf("%w: stream identifier or keep_latest is invalid", ErrInvalidInput)
+	}
+	if err := s.cleanupPendingDeletions(ctx); err != nil {
+		return PruneResult{}, err
+	}
+	var streamExists int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM backup_streams WHERE id = ?`, streamID).Scan(&streamExists); errors.Is(err, sql.ErrNoRows) {
+		return PruneResult{}, ErrNotFound
+	} else if err != nil {
+		return PruneResult{}, fmt.Errorf("read backup stream: %w", err)
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, storage_path
+FROM backups
+WHERE stream_id = ?
+ORDER BY created_at DESC, id DESC
+LIMIT -1 OFFSET ?`, streamID, keepLatest)
+	if err != nil {
+		return PruneResult{}, fmt.Errorf("list backups to prune: %w", err)
+	}
+	type candidate struct {
+		id   string
+		path string
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.id, &item.path); err != nil {
+			rows.Close()
+			return PruneResult{}, fmt.Errorf("scan backup to prune: %w", err)
+		}
+		candidates = append(candidates, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return PruneResult{}, fmt.Errorf("iterate backups to prune: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return PruneResult{}, fmt.Errorf("close backups to prune: %w", err)
+	}
+	if len(candidates) == 0 {
+		return PruneResult{StreamID: streamID, KeepLatest: keepLatest}, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PruneResult{}, fmt.Errorf("begin prune transaction: %w", err)
+	}
+	deletionTime := s.now().UTC().Format(time.RFC3339Nano)
+	for _, item := range candidates {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO pending_blob_deletions(storage_path, queued_at)
+VALUES(?, ?)
+ON CONFLICT(storage_path) DO NOTHING`, item.path, deletionTime); err != nil {
+			tx.Rollback()
+			return PruneResult{}, fmt.Errorf("queue backup blob deletion: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM backups WHERE id = ? AND stream_id = ?`, item.id, streamID); err != nil {
+			tx.Rollback()
+			return PruneResult{}, fmt.Errorf("delete backup metadata: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return PruneResult{}, fmt.Errorf("commit backup prune: %w", err)
+	}
+	if err := s.cleanupPendingDeletions(ctx); err != nil {
+		return PruneResult{}, err
+	}
+	return PruneResult{StreamID: streamID, KeepLatest: keepLatest, DeletedCount: len(candidates)}, nil
 }
 
 func (s *Store) latestBackup(ctx context.Context, streamID, databaseName string) (Backup, error) {

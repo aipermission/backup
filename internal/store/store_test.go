@@ -97,6 +97,65 @@ func TestStoreRejectsConflictingStreamAndRemovesBlob(t *testing.T) {
 	}
 }
 
+func TestStorePrunesOldBackupsAndPreservesLatestVersions(t *testing.T) {
+	storage, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { storage.Close() })
+	now := time.Date(2026, time.July, 31, 10, 0, 0, 0, time.UTC)
+	storage.now = func() time.Time {
+		now = now.Add(time.Second)
+		return now
+	}
+	var created []Backup
+	for _, value := range []string{"first", "second", "third", "fourth"} {
+		item, err := storage.CreateBackup(context.Background(), "project-a", "Project A", "install-a", bytes.NewReader([]byte(value)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		created = append(created, item)
+	}
+
+	result, err := storage.PruneBackups(context.Background(), "project-a", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeletedCount != 2 || result.KeepLatest != 2 {
+		t.Fatalf("unexpected prune result: %#v", result)
+	}
+	page, err := storage.ListBackups(context.Background(), "project-a", 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || page.Items[0].ID != created[3].ID || page.Items[1].ID != created[2].ID {
+		t.Fatalf("unexpected retained backups: %#v", page.Items)
+	}
+	for _, pruned := range created[:2] {
+		if _, _, err := storage.OpenBackup(context.Background(), "project-a", pruned.ID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected pruned backup %s to be absent, got %v", pruned.ID, err)
+		}
+	}
+	var pending int
+	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM pending_blob_deletions`).Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("pending deletion queue was not drained: count=%d err=%v", pending, err)
+	}
+}
+
+func TestStorePruneValidatesStreamAndRetention(t *testing.T) {
+	storage, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { storage.Close() })
+	if _, err := storage.PruneBackups(context.Background(), "missing", 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing stream, got %v", err)
+	}
+	if _, err := storage.PruneBackups(context.Background(), "project-a", 0); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("expected invalid retention, got %v", err)
+	}
+}
+
 func TestStoreDetectsCorruptionAndCleansTemporaryFiles(t *testing.T) {
 	dataDir := t.TempDir()
 	temporaryDir := filepath.Join(dataDir, "temporary")
@@ -146,5 +205,35 @@ func TestStoreRejectsNewerMetadataSchema(t *testing.T) {
 	}
 	if _, err := Open(dataDir); err == nil {
 		t.Fatal("expected newer metadata schema to be rejected")
+	}
+}
+
+func TestStoreMigratesVersionOneMetadata(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := sql.Open("sqlite", filepath.Join(dataDir, "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.Exec(`PRAGMA user_version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := metadata.Close(); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	var schemaVersion int
+	if err := storage.db.QueryRow(`PRAGMA user_version`).Scan(&schemaVersion); err != nil || schemaVersion != SchemaVersion {
+		t.Fatalf("unexpected migrated schema version: version=%d err=%v", schemaVersion, err)
+	}
+	var tableCount int
+	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_blob_deletions'`).Scan(&tableCount); err != nil || tableCount != 1 {
+		t.Fatalf("pending deletion table missing: count=%d err=%v", tableCount, err)
 	}
 }

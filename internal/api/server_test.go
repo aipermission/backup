@@ -53,6 +53,14 @@ func TestBackupLifecycleAndAuthentication(t *testing.T) {
 	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), payload) {
 		t.Fatalf("unexpected download: %d %q", response.Code, response.Body.Bytes())
 	}
+
+	request = authorizedRequest(http.MethodPost, "/v1/streams/project-a/prune", bytes.NewBufferString(`{"keep_latest":1}`))
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"keep_latest":1`)) {
+		t.Fatalf("unexpected prune response: %d %s", response.Code, response.Body.String())
+	}
 }
 
 func TestProtocolAndUploadLimits(t *testing.T) {
@@ -73,6 +81,17 @@ func TestProtocolAndUploadLimits(t *testing.T) {
 	server.ServeHTTP(response, request)
 	if response.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestPruneRejectsUnsafeRetention(t *testing.T) {
+	server := newTestServer(t, 1024)
+	request := authorizedRequest(http.MethodPost, "/v1/streams/project-a/prune", bytes.NewBufferString(`{"keep_latest":0}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", response.Code, response.Body.String())
 	}
 }
 

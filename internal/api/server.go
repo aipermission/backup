@@ -42,6 +42,7 @@ func New(config Config, storage *store.Store, logger *slog.Logger) http.Handler 
 	mux.Handle("GET /v1/streams", server.auth(server.protocol(http.HandlerFunc(server.listStreams))))
 	mux.Handle("POST /v1/streams/{stream_id}/backups", server.auth(server.protocol(http.HandlerFunc(server.upload))))
 	mux.Handle("GET /v1/streams/{stream_id}/backups", server.auth(server.protocol(http.HandlerFunc(server.listBackups))))
+	mux.Handle("POST /v1/streams/{stream_id}/prune", server.auth(server.protocol(http.HandlerFunc(server.pruneBackups))))
 	mux.Handle("GET /v1/streams/{stream_id}/backups/{backup_id}", server.auth(server.protocol(http.HandlerFunc(server.download))))
 	server.api = mux
 	return server.recover(server.securityHeaders(server.requestLog(mux)))
@@ -56,10 +57,46 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"service":          "aipermission-backup",
 		"version":          s.config.Version,
 		"protocol_version": protocolVersion,
-		"capabilities":     []string{"immutable_upload", "list_streams", "list_versions", "download"},
+		"capabilities":     []string{"immutable_upload", "list_streams", "list_versions", "download", "prune_versions"},
 		"max_upload_bytes": s.config.MaxUploadBytes,
 		"storage_schema":   store.SchemaVersion,
 	})
+}
+
+func (s *Server) pruneBackups(w http.ResponseWriter, r *http.Request) {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+		return
+	}
+	var request struct {
+		KeepLatest int `json:"keep_latest"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_prune_request", "request must contain keep_latest between 1 and 1000")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid_prune_request", "request must contain one JSON object")
+		return
+	}
+	result, err := s.store.PruneBackups(r.Context(), r.PathValue("stream_id"), request.KeepLatest)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrInvalidInput):
+			writeError(w, http.StatusBadRequest, "invalid_prune_request", "keep_latest must be between 1 and 1000")
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "stream_not_found", "backup stream was not found")
+		default:
+			s.logger.Error("prune backups", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "backup versions could not be pruned")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
