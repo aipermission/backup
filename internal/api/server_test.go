@@ -95,6 +95,49 @@ func TestPruneRejectsUnsafeRetention(t *testing.T) {
 	}
 }
 
+func TestDeleteSelectedBackupsAndProtectLastVersion(t *testing.T) {
+	server := newTestServer(t, 1024)
+	created := make([]store.Backup, 0, 3)
+	for _, payload := range []string{"first", "second", "third"} {
+		request := authorizedRequest(http.MethodPost, "/v1/streams/project-a/backups", bytes.NewBufferString(payload))
+		request.Header.Set("Content-Type", "application/octet-stream")
+		request.Header.Set("X-AIPermission-Database-Name", "Project A")
+		request.Header.Set("X-AIPermission-Source-Installation-ID", "install-a")
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("create backup: %d %s", response.Code, response.Body.String())
+		}
+		var item store.Backup
+		if err := json.NewDecoder(response.Body).Decode(&item); err != nil {
+			t.Fatal(err)
+		}
+		created = append(created, item)
+	}
+
+	request := authorizedRequest(http.MethodDelete, "/v1/streams/project-a/backups/"+created[0].ID, nil)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(created[0].ID)) {
+		t.Fatalf("delete one backup: %d %s", response.Code, response.Body.String())
+	}
+
+	request = authorizedRequest(http.MethodPost, "/v1/streams/project-a/backups/delete", bytes.NewBufferString(`{"backup_ids":["`+created[1].ID+`"]}`))
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(created[1].ID)) {
+		t.Fatalf("delete selected backups: %d %s", response.Code, response.Body.String())
+	}
+
+	request = authorizedRequest(http.MethodDelete, "/v1/streams/project-a/backups/"+created[2].ID, nil)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !bytes.Contains(response.Body.Bytes(), []byte("last_backup_protected")) {
+		t.Fatalf("last backup was not protected: %d %s", response.Code, response.Body.String())
+	}
+}
+
 func newTestServer(t *testing.T, maxBytes int64) http.Handler {
 	t.Helper()
 	storage, err := store.Open(t.TempDir())
