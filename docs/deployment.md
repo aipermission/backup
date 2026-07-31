@@ -20,6 +20,11 @@ through a VPN or private overlay network and keep HTTPS enabled. Direct public
 internet exposure of the raw backup port is outside the recommended deployment
 shape.
 
+Use `docker-compose.release.yml` for normal installations. It pulls the pinned
+`ghcr.io/aipermission/backup` release selected by
+`AIPERMISSION_BACKUP_VERSION`; the default source Compose file remains the
+development build path.
+
 Back up the Docker volume independently if service availability matters. The
 volume contains encrypted AIPermission snapshots and limited metadata, but its
 disclosure still allows offline guessing against weak database passwords.
@@ -28,8 +33,10 @@ disclosure still allows offline guessing against weak database passwords.
 
 1. Stop new uploads from AIPermission.
 2. Back up the service volume.
-3. Pull the pinned release image.
-4. Start the container and wait for `/healthz`.
+3. Set `AIPERMISSION_BACKUP_VERSION` to the intended release and run
+   `docker compose -f docker-compose.release.yml pull`.
+4. Run `docker compose -f docker-compose.release.yml up -d` and wait for
+   `/healthz`.
 5. Verify `/v1/info` protocol compatibility before resuming uploads.
 
 Never point two service versions at the same writable volume concurrently.

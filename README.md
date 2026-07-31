@@ -38,7 +38,8 @@ openssl rand -hex 32 > secrets/backup-token
 chmod 640 secrets/backup-token
 printf 'AIPERMISSION_BACKUP_SECRET_GID=%s\n' "$(id -g)" > .env
 chmod 600 .env
-docker compose up -d --build
+docker compose -f docker-compose.release.yml pull
+docker compose -f docker-compose.release.yml up -d
 ```
 
 Compose mounts the token as a file and adds only its host group ID to the
@@ -51,6 +52,10 @@ another trusted computer, publish it through an HTTPS reverse proxy and keep the
 raw service port private. For access across the internet, use a VPN or private
 overlay network rather than exposing the service port directly. AIPermission
 rejects plaintext non-loopback provider URLs.
+
+The release Compose file defaults to the pinned `0.1.0` image. Set
+`AIPERMISSION_BACKUP_VERSION` explicitly when upgrading. Contributors can use
+`docker compose up -d --build` to build the development image from source.
 
 Check the local service:
 
