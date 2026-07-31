@@ -1,0 +1,5 @@
+/aipermission-backup
+/.env
+/data/
+/secrets/
+*.test
