@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.aipdb binary
+*.db binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
