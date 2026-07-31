@@ -91,9 +91,30 @@ older versions from that stream. Metadata deletion is transactional; blob
 paths are queued durably and removed after commit so interrupted cleanup can
 resume on service startup. The endpoint never deletes the newest version.
 
+## Delete Selected Versions
+
+```http
+DELETE /v1/streams/{stream_id}/backups/{backup_id}
+```
+
+For an explicitly reviewed batch:
+
+```http
+POST /v1/streams/{stream_id}/backups/delete
+Content-Type: application/json
+
+{"backup_ids":["bkp_first","bkp_second"]}
+```
+
+Batch deletion accepts 1-100 unique backup IDs. Every requested ID must exist
+in the selected stream or the operation fails without deleting anything. At
+least one recovery version must remain in each stream. Selected-version and
+prune operations use the same transactional metadata deletion and durable blob
+cleanup queue.
+
 ## Deliberately Absent From v1
 
-- individual delete, stream rename, or overwrite;
+- stream rename or overwrite;
 - background jobs or scheduled uploads;
 - server-side restore or SQLCipher access;
 - account, OAuth, team, or sharing APIs;
