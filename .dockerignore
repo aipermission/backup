@@ -1,6 +1,8 @@
 .git
 .github
+.env
+.env.*
 data
+secrets
 aipermission-backup
 *.test
-
