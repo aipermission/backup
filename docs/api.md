@@ -76,9 +76,24 @@ The service verifies the stored byte size and SHA-256 before returning
 digest. Missing blobs or digest mismatches return `409 backup_corrupt` rather
 than unverified content.
 
+## Prune Old Versions
+
+```http
+POST /v1/streams/{stream_id}/prune
+Content-Type: application/json
+
+{"keep_latest": 10}
+```
+
+`keep_latest` must be an integer from 1 to 1000. The service preserves exactly
+the newest requested number of immutable versions and permanently removes only
+older versions from that stream. Metadata deletion is transactional; blob
+paths are queued durably and removed after commit so interrupted cleanup can
+resume on service startup. The endpoint never deletes the newest version.
+
 ## Deliberately Absent From v1
 
-- delete, prune, rename, or overwrite;
+- individual delete, stream rename, or overwrite;
 - background jobs or scheduled uploads;
 - server-side restore or SQLCipher access;
 - account, OAuth, team, or sharing APIs;
