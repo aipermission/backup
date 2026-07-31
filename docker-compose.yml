@@ -1,0 +1,33 @@
+services:
+  backup:
+    build:
+      context: .
+      args:
+        VERSION: dev
+    image: ghcr.io/aipermission/backup:dev
+    restart: unless-stopped
+    environment:
+      AIPERMISSION_BACKUP_LISTEN_ADDR: 0.0.0.0:8080
+      AIPERMISSION_BACKUP_TOKEN_FILE: /run/secrets/backup_token
+    secrets:
+      - backup_token
+    group_add:
+      - "${AIPERMISSION_BACKUP_SECRET_GID:-1000}"
+    volumes:
+      - backup_data:/data
+    ports:
+      - "127.0.0.1:${AIPERMISSION_BACKUP_PORT:-8080}:8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+secrets:
+  backup_token:
+    file: ./secrets/backup-token
+
+volumes:
+  backup_data:
