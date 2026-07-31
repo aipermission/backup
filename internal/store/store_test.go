@@ -156,6 +156,62 @@ func TestStorePruneValidatesStreamAndRetention(t *testing.T) {
 	}
 }
 
+func TestStoreDeletesSelectedBackupsAndProtectsLastVersion(t *testing.T) {
+	storage, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { storage.Close() })
+	now := time.Date(2026, time.July, 31, 10, 0, 0, 0, time.UTC)
+	storage.now = func() time.Time {
+		now = now.Add(time.Second)
+		return now
+	}
+	var created []Backup
+	for _, value := range []string{"first", "second", "third", "fourth"} {
+		item, createErr := storage.CreateBackup(context.Background(), "project-a", "Project A", "install-a", bytes.NewReader([]byte(value)))
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		created = append(created, item)
+	}
+
+	result, err := storage.DeleteBackups(context.Background(), "project-a", []string{created[3].ID, created[1].ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeletedCount != 2 || len(result.DeletedIDs) != 2 {
+		t.Fatalf("unexpected delete result: %#v", result)
+	}
+	page, err := storage.ListBackups(context.Background(), "project-a", 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || page.Items[0].ID != created[2].ID || page.Items[1].ID != created[0].ID {
+		t.Fatalf("unexpected retained backups: %#v", page.Items)
+	}
+	streams, err := storage.ListStreams(context.Background(), 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(streams.Items) != 1 || streams.Items[0].LatestBackup == nil || streams.Items[0].LatestBackup.ID != created[2].ID || streams.Items[0].UpdatedAt != created[2].CreatedAt {
+		t.Fatalf("stream latest metadata was not updated: %#v", streams.Items)
+	}
+	if _, err := storage.DeleteBackups(context.Background(), "project-a", []string{created[2].ID, created[0].ID}); !errors.Is(err, ErrLastBackup) {
+		t.Fatalf("expected last backup protection, got %v", err)
+	}
+	if _, err := storage.DeleteBackups(context.Background(), "project-a", []string{created[0].ID, created[0].ID}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("expected duplicate ids to be rejected, got %v", err)
+	}
+	if _, err := storage.DeleteBackups(context.Background(), "project-a", []string{"missing"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing backup, got %v", err)
+	}
+	var pending int
+	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM pending_blob_deletions`).Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("pending deletion queue was not drained: count=%d err=%v", pending, err)
+	}
+}
+
 func TestStoreDetectsCorruptionAndCleansTemporaryFiles(t *testing.T) {
 	dataDir := t.TempDir()
 	temporaryDir := filepath.Join(dataDir, "temporary")

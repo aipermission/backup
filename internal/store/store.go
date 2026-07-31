@@ -23,6 +23,7 @@ import (
 var (
 	ErrInvalidInput   = errors.New("invalid input")
 	ErrNotFound       = errors.New("backup not found")
+	ErrLastBackup     = errors.New("the last backup in a stream cannot be deleted")
 	ErrStreamConflict = errors.New("stream metadata conflicts with the existing stream")
 	ErrCorrupt        = errors.New("stored backup checksum does not match metadata")
 	identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -69,6 +70,17 @@ type PruneResult struct {
 	StreamID     string `json:"stream_id"`
 	KeepLatest   int    `json:"keep_latest"`
 	DeletedCount int    `json:"deleted_count"`
+}
+
+type DeleteResult struct {
+	StreamID     string   `json:"stream_id"`
+	DeletedIDs   []string `json:"deleted_ids"`
+	DeletedCount int      `json:"deleted_count"`
+}
+
+type deletionCandidate struct {
+	id   string
+	path string
 }
 
 func Open(dataDir string) (*Store, error) {
@@ -499,13 +511,9 @@ LIMIT -1 OFFSET ?`, streamID, keepLatest)
 	if err != nil {
 		return PruneResult{}, fmt.Errorf("list backups to prune: %w", err)
 	}
-	type candidate struct {
-		id   string
-		path string
-	}
-	var candidates []candidate
+	var candidates []deletionCandidate
 	for rows.Next() {
-		var item candidate
+		var item deletionCandidate
 		if err := rows.Scan(&item.id, &item.path); err != nil {
 			rows.Close()
 			return PruneResult{}, fmt.Errorf("scan backup to prune: %w", err)
@@ -523,9 +531,90 @@ LIMIT -1 OFFSET ?`, streamID, keepLatest)
 		return PruneResult{StreamID: streamID, KeepLatest: keepLatest}, nil
 	}
 
+	if err := s.deleteCandidates(ctx, streamID, candidates); err != nil {
+		return PruneResult{}, err
+	}
+	return PruneResult{StreamID: streamID, KeepLatest: keepLatest, DeletedCount: len(candidates)}, nil
+}
+
+func (s *Store) DeleteBackups(ctx context.Context, streamID string, backupIDs []string) (DeleteResult, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if !ValidateIdentifier(streamID) || len(backupIDs) < 1 || len(backupIDs) > 100 {
+		return DeleteResult{}, fmt.Errorf("%w: stream identifier or backup ids are invalid", ErrInvalidInput)
+	}
+	seen := make(map[string]struct{}, len(backupIDs))
+	for _, id := range backupIDs {
+		if !ValidateIdentifier(id) {
+			return DeleteResult{}, fmt.Errorf("%w: backup id is invalid", ErrInvalidInput)
+		}
+		if _, exists := seen[id]; exists {
+			return DeleteResult{}, fmt.Errorf("%w: backup ids must be unique", ErrInvalidInput)
+		}
+		seen[id] = struct{}{}
+	}
+	if err := s.cleanupPendingDeletions(ctx); err != nil {
+		return DeleteResult{}, err
+	}
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE stream_id = ?`, streamID).Scan(&total); err != nil {
+		return DeleteResult{}, fmt.Errorf("count stream backups: %w", err)
+	}
+	if total == 0 {
+		return DeleteResult{}, ErrNotFound
+	}
+
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(backupIDs)), ",")
+	args := make([]any, 0, len(backupIDs)+1)
+	args = append(args, streamID)
+	for _, id := range backupIDs {
+		args = append(args, id)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, storage_path
+FROM backups
+WHERE stream_id = ? AND id IN (`+placeholders+`)
+ORDER BY created_at DESC, id DESC`, args...)
+	if err != nil {
+		return DeleteResult{}, fmt.Errorf("list backups to delete: %w", err)
+	}
+	var candidates []deletionCandidate
+	for rows.Next() {
+		var item deletionCandidate
+		if err := rows.Scan(&item.id, &item.path); err != nil {
+			rows.Close()
+			return DeleteResult{}, fmt.Errorf("scan backup to delete: %w", err)
+		}
+		candidates = append(candidates, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return DeleteResult{}, fmt.Errorf("iterate backups to delete: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return DeleteResult{}, fmt.Errorf("close backups to delete: %w", err)
+	}
+	if len(candidates) != len(backupIDs) {
+		return DeleteResult{}, ErrNotFound
+	}
+	if total <= len(candidates) {
+		return DeleteResult{}, ErrLastBackup
+	}
+	if err := s.deleteCandidates(ctx, streamID, candidates); err != nil {
+		return DeleteResult{}, err
+	}
+	deletedIDs := make([]string, 0, len(candidates))
+	for _, item := range candidates {
+		deletedIDs = append(deletedIDs, item.id)
+	}
+	return DeleteResult{StreamID: streamID, DeletedIDs: deletedIDs, DeletedCount: len(deletedIDs)}, nil
+}
+
+func (s *Store) deleteCandidates(ctx context.Context, streamID string, candidates []deletionCandidate) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return PruneResult{}, fmt.Errorf("begin prune transaction: %w", err)
+		return fmt.Errorf("begin backup deletion transaction: %w", err)
 	}
 	deletionTime := s.now().UTC().Format(time.RFC3339Nano)
 	for _, item := range candidates {
@@ -534,20 +623,24 @@ INSERT INTO pending_blob_deletions(storage_path, queued_at)
 VALUES(?, ?)
 ON CONFLICT(storage_path) DO NOTHING`, item.path, deletionTime); err != nil {
 			tx.Rollback()
-			return PruneResult{}, fmt.Errorf("queue backup blob deletion: %w", err)
+			return fmt.Errorf("queue backup blob deletion: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM backups WHERE id = ? AND stream_id = ?`, item.id, streamID); err != nil {
 			tx.Rollback()
-			return PruneResult{}, fmt.Errorf("delete backup metadata: %w", err)
+			return fmt.Errorf("delete backup metadata: %w", err)
 		}
 	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE backup_streams
+SET updated_at = (SELECT created_at FROM backups WHERE stream_id = ? ORDER BY created_at DESC, id DESC LIMIT 1)
+WHERE id = ?`, streamID, streamID); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("update backup stream after deletion: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
-		return PruneResult{}, fmt.Errorf("commit backup prune: %w", err)
+		return fmt.Errorf("commit backup deletion: %w", err)
 	}
-	if err := s.cleanupPendingDeletions(ctx); err != nil {
-		return PruneResult{}, err
-	}
-	return PruneResult{StreamID: streamID, KeepLatest: keepLatest, DeletedCount: len(candidates)}, nil
+	return s.cleanupPendingDeletions(ctx)
 }
 
 func (s *Store) latestBackup(ctx context.Context, streamID, databaseName string) (Backup, error) {

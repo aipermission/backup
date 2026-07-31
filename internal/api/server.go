@@ -43,6 +43,8 @@ func New(config Config, storage *store.Store, logger *slog.Logger) http.Handler 
 	mux.Handle("POST /v1/streams/{stream_id}/backups", server.auth(server.protocol(http.HandlerFunc(server.upload))))
 	mux.Handle("GET /v1/streams/{stream_id}/backups", server.auth(server.protocol(http.HandlerFunc(server.listBackups))))
 	mux.Handle("POST /v1/streams/{stream_id}/prune", server.auth(server.protocol(http.HandlerFunc(server.pruneBackups))))
+	mux.Handle("POST /v1/streams/{stream_id}/backups/delete", server.auth(server.protocol(http.HandlerFunc(server.deleteBackups))))
+	mux.Handle("DELETE /v1/streams/{stream_id}/backups/{backup_id}", server.auth(server.protocol(http.HandlerFunc(server.deleteBackup))))
 	mux.Handle("GET /v1/streams/{stream_id}/backups/{backup_id}", server.auth(server.protocol(http.HandlerFunc(server.download))))
 	server.api = mux
 	return server.recover(server.securityHeaders(server.requestLog(mux)))
@@ -57,10 +59,56 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"service":          "aipermission-backup",
 		"version":          s.config.Version,
 		"protocol_version": protocolVersion,
-		"capabilities":     []string{"immutable_upload", "list_streams", "list_versions", "download", "prune_versions"},
+		"capabilities":     []string{"immutable_upload", "list_streams", "list_versions", "download", "prune_versions", "delete_versions"},
 		"max_upload_bytes": s.config.MaxUploadBytes,
 		"storage_schema":   store.SchemaVersion,
 	})
+}
+
+func (s *Server) deleteBackup(w http.ResponseWriter, r *http.Request) {
+	s.deleteBackupIDs(w, r, []string{r.PathValue("backup_id")})
+}
+
+func (s *Server) deleteBackups(w http.ResponseWriter, r *http.Request) {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+		return
+	}
+	var request struct {
+		BackupIDs []string `json:"backup_ids"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8192)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_delete_request", "request must contain 1 to 100 backup_ids")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid_delete_request", "request must contain one JSON object")
+		return
+	}
+	s.deleteBackupIDs(w, r, request.BackupIDs)
+}
+
+func (s *Server) deleteBackupIDs(w http.ResponseWriter, r *http.Request, backupIDs []string) {
+	result, err := s.store.DeleteBackups(r.Context(), r.PathValue("stream_id"), backupIDs)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrInvalidInput):
+			writeError(w, http.StatusBadRequest, "invalid_delete_request", "backup_ids must contain 1 to 100 unique backup identifiers")
+		case errors.Is(err, store.ErrLastBackup):
+			writeError(w, http.StatusConflict, "last_backup_protected", "at least one backup version must remain in the stream")
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "backup_not_found", "one or more selected backups were not found")
+		default:
+			s.logger.Error("delete backups", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "backup versions could not be deleted")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) pruneBackups(w http.ResponseWriter, r *http.Request) {
