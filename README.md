@@ -14,6 +14,14 @@ This repository is a passive blob store, not a remotely hosted AIPermission
 gateway. It has no accounts, team model, command execution, connector access,
 browser session, or SaaS control plane.
 
+The recommended deployment is one backup service shared by the owner's trusted
+computers over a private local network. Keep the raw service port private and
+publish it through an HTTPS reverse proxy; non-loopback AIPermission clients
+reject plaintext HTTP. When clients must connect across different networks,
+place the service behind a VPN or private overlay network and keep HTTPS enabled
+inside that network. Direct exposure of the backup port to the public internet
+is not the recommended deployment.
+
 An encrypted database copy still enables offline password guessing if storage
 is compromised. AIPermission therefore applies a stronger database-password
 gate before enabling remote backup. The service checksum detects corruption; it
@@ -39,8 +47,10 @@ variable. Both `.env` and `secrets/` are git-ignored; keep the token readable by
 its owner and group only.
 
 The example Compose file binds the service to `127.0.0.1:8080`. For access from
-another machine, publish it through an HTTPS reverse proxy and keep the raw
-service port private. AIPermission rejects plaintext non-loopback provider URLs.
+another trusted computer, publish it through an HTTPS reverse proxy and keep the
+raw service port private. For access across the internet, use a VPN or private
+overlay network rather than exposing the service port directly. AIPermission
+rejects plaintext non-loopback provider URLs.
 
 Check the local service:
 
