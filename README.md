@@ -53,7 +53,7 @@ raw service port private. For access across the internet, use a VPN or private
 overlay network rather than exposing the service port directly. AIPermission
 rejects plaintext non-loopback provider URLs.
 
-The release Compose file defaults to the pinned `0.1.0` image. Set
+The release Compose file defaults to the pinned `0.1.1` image. Set
 `AIPERMISSION_BACKUP_VERSION` explicitly when upgrading. Contributors can use
 `docker compose up -d --build` to build the development image from source.
 

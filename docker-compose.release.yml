@@ -1,6 +1,6 @@
 services:
   backup:
-    image: ghcr.io/aipermission/backup:${AIPERMISSION_BACKUP_VERSION:-0.1.0}
+    image: ghcr.io/aipermission/backup:${AIPERMISSION_BACKUP_VERSION:-0.1.1}
     restart: unless-stopped
     environment:
       AIPERMISSION_BACKUP_LISTEN_ADDR: 0.0.0.0:8080
