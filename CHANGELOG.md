@@ -2,6 +2,22 @@
 
 All notable changes to AIPermission Backup are documented in this file.
 
+## [0.1.1] - 2026-08-01
+
+### Added
+
+- Added exact single-version and selected-version deletion for explicit backup
+  cleanup without relying on keep-last-N ordering.
+- Added durable restart-safe blob cleanup after selected backup records are
+  removed.
+
+### Security
+
+- The final recovery version in a stream cannot be deleted, including through
+  batch requests.
+- Selected deletion remains authenticated, bounded, stream-scoped, and limited
+  to immutable backup identifiers.
+
 ## [0.1.0] - 2026-07-31
 
 ### Added
