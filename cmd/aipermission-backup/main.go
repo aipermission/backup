@@ -32,7 +32,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	storage, err := store.Open(cfg.DataDir)
+	storage, err := store.Open(cfg.DataDir, store.Options{MaxStorageBytes: cfg.MaxStorageBytes})
 	if err != nil {
 		logger.Error("open backup store", "error", err)
 		os.Exit(1)

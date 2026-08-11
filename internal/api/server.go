@@ -39,10 +39,14 @@ func New(config Config, storage *store.Store, logger *slog.Logger) http.Handler 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.health)
 	mux.Handle("GET /v1/info", server.auth(http.HandlerFunc(server.info)))
+	mux.Handle("GET /v1/storage", server.auth(server.protocol(http.HandlerFunc(server.storageInfo))))
 	mux.Handle("GET /v1/streams", server.auth(server.protocol(http.HandlerFunc(server.listStreams))))
 	mux.Handle("POST /v1/streams/{stream_id}/backups", server.auth(server.protocol(http.HandlerFunc(server.upload))))
 	mux.Handle("GET /v1/streams/{stream_id}/backups", server.auth(server.protocol(http.HandlerFunc(server.listBackups))))
 	mux.Handle("POST /v1/streams/{stream_id}/prune", server.auth(server.protocol(http.HandlerFunc(server.pruneBackups))))
+	mux.Handle("GET /v1/streams/{stream_id}/retention", server.auth(server.protocol(http.HandlerFunc(server.getRetention))))
+	mux.Handle("POST /v1/streams/{stream_id}/retention/preview", server.auth(server.protocol(http.HandlerFunc(server.previewRetention))))
+	mux.Handle("PUT /v1/streams/{stream_id}/retention", server.auth(server.protocol(http.HandlerFunc(server.updateRetention))))
 	mux.Handle("POST /v1/streams/{stream_id}/backups/delete", server.auth(server.protocol(http.HandlerFunc(server.deleteBackups))))
 	mux.Handle("DELETE /v1/streams/{stream_id}/backups/{backup_id}", server.auth(server.protocol(http.HandlerFunc(server.deleteBackup))))
 	mux.Handle("GET /v1/streams/{stream_id}/backups/{backup_id}", server.auth(server.protocol(http.HandlerFunc(server.download))))
@@ -59,7 +63,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"service":          "aipermission-backup",
 		"version":          s.config.Version,
 		"protocol_version": protocolVersion,
-		"capabilities":     []string{"immutable_upload", "list_streams", "list_versions", "download", "prune_versions", "delete_versions"},
+		"capabilities":     []string{"immutable_upload", "list_streams", "list_versions", "download", "prune_versions", "delete_versions", "storage_usage", "automatic_retention"},
 		"max_upload_bytes": s.config.MaxUploadBytes,
 		"storage_schema":   store.SchemaVersion,
 	})
@@ -174,6 +178,8 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusRequestEntityTooLarge, "upload_too_large", "backup exceeds the configured upload limit")
 		case errors.Is(err, store.ErrInvalidInput):
 			writeError(w, http.StatusBadRequest, "invalid_backup", strings.TrimPrefix(err.Error(), store.ErrInvalidInput.Error()+": "))
+		case errors.Is(err, store.ErrQuotaExceeded):
+			writeError(w, http.StatusInsufficientStorage, "storage_quota_exceeded", "backup storage quota does not have enough remaining capacity")
 		default:
 			s.logger.Error("upload backup", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal_error", "backup could not be stored")

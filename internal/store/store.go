@@ -26,39 +26,47 @@ var (
 	ErrLastBackup     = errors.New("the last backup in a stream cannot be deleted")
 	ErrStreamConflict = errors.New("stream metadata conflicts with the existing stream")
 	ErrCorrupt        = errors.New("stored backup checksum does not match metadata")
+	ErrQuotaExceeded  = errors.New("backup storage quota exceeded")
 	identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
 
-const SchemaVersion = 2
+const SchemaVersion = 3
+
+type Options struct {
+	MaxStorageBytes int64
+}
 
 type Store struct {
-	db         *sql.DB
-	dataDir    string
-	blobDir    string
-	tempDir    string
-	now        func() time.Time
-	mutationMu sync.Mutex
+	db              *sql.DB
+	dataDir         string
+	blobDir         string
+	tempDir         string
+	now             func() time.Time
+	maxStorageBytes int64
+	mutationMu      sync.Mutex
 }
 
 type Backup struct {
-	ID                   string `json:"id"`
-	StreamID             string `json:"stream_id"`
-	DatabaseName         string `json:"database_name"`
-	SourceInstallationID string `json:"source_installation_id"`
-	Filename             string `json:"filename"`
-	SizeBytes            int64  `json:"size_bytes"`
-	SHA256               string `json:"sha256"`
-	CreatedAt            string `json:"created_at"`
-	storagePath          string
+	ID                    string `json:"id"`
+	StreamID              string `json:"stream_id"`
+	DatabaseName          string `json:"database_name"`
+	SourceInstallationID  string `json:"source_installation_id"`
+	Filename              string `json:"filename"`
+	SizeBytes             int64  `json:"size_bytes"`
+	SHA256                string `json:"sha256"`
+	CreatedAt             string `json:"created_at"`
+	RetentionDeletedCount int    `json:"retention_deleted_count,omitempty"`
+	storagePath           string
 }
 
 type Stream struct {
-	ID           string  `json:"id"`
-	DatabaseName string  `json:"database_name"`
-	CreatedAt    string  `json:"created_at"`
-	UpdatedAt    string  `json:"updated_at"`
-	BackupCount  int64   `json:"backup_count"`
-	LatestBackup *Backup `json:"latest_backup,omitempty"`
+	ID                  string  `json:"id"`
+	DatabaseName        string  `json:"database_name"`
+	CreatedAt           string  `json:"created_at"`
+	UpdatedAt           string  `json:"updated_at"`
+	BackupCount         int64   `json:"backup_count"`
+	RetentionKeepLatest *int    `json:"retention_keep_latest,omitempty"`
+	LatestBackup        *Backup `json:"latest_backup,omitempty"`
 }
 
 type Page[T any] struct {
@@ -81,9 +89,10 @@ type DeleteResult struct {
 type deletionCandidate struct {
 	id   string
 	path string
+	size int64
 }
 
-func Open(dataDir string) (*Store, error) {
+func Open(dataDir string, options ...Options) (*Store, error) {
 	if strings.TrimSpace(dataDir) == "" {
 		return nil, errors.New("data directory is required")
 	}
@@ -105,7 +114,18 @@ func Open(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("open metadata database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db, dataDir: dataDir, blobDir: blobDir, tempDir: tempDir, now: time.Now}
+	var opts Options
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	if opts.MaxStorageBytes < 0 {
+		db.Close()
+		return nil, errors.New("maximum storage bytes cannot be negative")
+	}
+	store := &Store{
+		db: db, dataDir: dataDir, blobDir: blobDir, tempDir: tempDir,
+		now: time.Now, maxStorageBytes: opts.MaxStorageBytes,
+	}
 	if err := store.initialize(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -160,6 +180,11 @@ CREATE TABLE IF NOT EXISTS pending_blob_deletions (
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("initialize metadata database: %w", err)
+	}
+	if schemaVersion < 3 {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE backup_streams ADD COLUMN retention_keep_latest INTEGER CHECK(retention_keep_latest BETWEEN 1 AND 1000)`); err != nil {
+			return fmt.Errorf("add backup stream retention policy: %w", err)
+		}
 	}
 	if schemaVersion < SchemaVersion {
 		if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
@@ -245,6 +270,16 @@ func (s *Store) CreateBackup(ctx context.Context, streamID, databaseName, source
 	if databaseName == "" || len(databaseName) > 128 {
 		return Backup{}, fmt.Errorf("%w: database name must contain 1 to 128 characters", ErrInvalidInput)
 	}
+	if err := s.cleanupPendingDeletions(ctx); err != nil {
+		return Backup{}, err
+	}
+	remaining, err := s.remainingStorageBytes(ctx)
+	if err != nil {
+		return Backup{}, err
+	}
+	if s.maxStorageBytes > 0 && remaining == 0 {
+		return Backup{}, ErrQuotaExceeded
+	}
 
 	id, err := randomID("bkp")
 	if err != nil {
@@ -264,12 +299,19 @@ func (s *Store) CreateBackup(ctx context.Context, streamID, databaseName, source
 	}()
 
 	hash := sha256.New()
-	size, err := io.Copy(io.MultiWriter(temporary, hash), body)
+	copySource := body
+	if s.maxStorageBytes > 0 {
+		copySource = io.LimitReader(body, remaining+1)
+	}
+	size, err := io.Copy(io.MultiWriter(temporary, hash), copySource)
 	if err != nil {
 		return Backup{}, fmt.Errorf("store upload: %w", err)
 	}
 	if size == 0 {
 		return Backup{}, fmt.Errorf("%w: backup body is empty", ErrInvalidInput)
+	}
+	if s.maxStorageBytes > 0 && size > remaining {
+		return Backup{}, ErrQuotaExceeded
 	}
 	if err := temporary.Sync(); err != nil {
 		return Backup{}, fmt.Errorf("flush temporary upload: %w", err)
@@ -332,11 +374,21 @@ INSERT INTO backups(id, stream_id, source_installation_id, filename, size_bytes,
 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, id, streamID, sourceInstallationID, filename, size, digest, createdText, relativePath); err != nil {
 		return Backup{}, fmt.Errorf("store backup metadata: %w", err)
 	}
+	retentionDeleted, err := s.applyConfiguredRetentionTx(ctx, tx, streamID)
+	if err != nil {
+		return Backup{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Backup{}, fmt.Errorf("commit backup metadata: %w", err)
 	}
 	removeFinal = false
-	return Backup{ID: id, StreamID: streamID, DatabaseName: databaseName, SourceInstallationID: sourceInstallationID, Filename: filename, SizeBytes: size, SHA256: digest, CreatedAt: createdText}, nil
+	_ = s.cleanupPendingDeletions(ctx)
+	return Backup{
+		ID: id, StreamID: streamID, DatabaseName: databaseName,
+		SourceInstallationID: sourceInstallationID, Filename: filename,
+		SizeBytes: size, SHA256: digest, CreatedAt: createdText,
+		RetentionDeletedCount: retentionDeleted,
+	}, nil
 }
 
 func (s *Store) ListStreams(ctx context.Context, limit int, cursor string) (Page[Stream], error) {
@@ -345,7 +397,7 @@ func (s *Store) ListStreams(ctx context.Context, limit int, cursor string) (Page
 		return Page[Stream]{}, err
 	}
 	query := `
-SELECT s.id, s.database_name, s.created_at, s.updated_at, COUNT(b.id)
+SELECT s.id, s.database_name, s.created_at, s.updated_at, COUNT(b.id), s.retention_keep_latest
 FROM backup_streams s
 LEFT JOIN backups b ON b.stream_id = s.id`
 	args := []any{}
@@ -362,7 +414,7 @@ LEFT JOIN backups b ON b.stream_id = s.id`
 	items := make([]Stream, 0, limit+1)
 	for rows.Next() {
 		var item Stream
-		if err := rows.Scan(&item.ID, &item.DatabaseName, &item.CreatedAt, &item.UpdatedAt, &item.BackupCount); err != nil {
+		if err := rows.Scan(&item.ID, &item.DatabaseName, &item.CreatedAt, &item.UpdatedAt, &item.BackupCount, &item.RetentionKeepLatest); err != nil {
 			rows.Close()
 			return Page[Stream]{}, fmt.Errorf("scan backup stream: %w", err)
 		}
@@ -616,26 +668,8 @@ func (s *Store) deleteCandidates(ctx context.Context, streamID string, candidate
 	if err != nil {
 		return fmt.Errorf("begin backup deletion transaction: %w", err)
 	}
-	deletionTime := s.now().UTC().Format(time.RFC3339Nano)
-	for _, item := range candidates {
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO pending_blob_deletions(storage_path, queued_at)
-VALUES(?, ?)
-ON CONFLICT(storage_path) DO NOTHING`, item.path, deletionTime); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("queue backup blob deletion: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM backups WHERE id = ? AND stream_id = ?`, item.id, streamID); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("delete backup metadata: %w", err)
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `
-UPDATE backup_streams
-SET updated_at = (SELECT created_at FROM backups WHERE stream_id = ? ORDER BY created_at DESC, id DESC LIMIT 1)
-WHERE id = ?`, streamID, streamID); err != nil {
-		tx.Rollback()
-		return fmt.Errorf("update backup stream after deletion: %w", err)
+	if err := queueDeletionCandidates(ctx, tx, streamID, candidates, s.now().UTC()); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit backup deletion: %w", err)
