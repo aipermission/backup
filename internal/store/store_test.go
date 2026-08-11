@@ -292,4 +292,8 @@ func TestStoreMigratesVersionOneMetadata(t *testing.T) {
 	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_blob_deletions'`).Scan(&tableCount); err != nil || tableCount != 1 {
 		t.Fatalf("pending deletion table missing: count=%d err=%v", tableCount, err)
 	}
+	var retentionColumnCount int
+	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('backup_streams') WHERE name = 'retention_keep_latest'`).Scan(&retentionColumnCount); err != nil || retentionColumnCount != 1 {
+		t.Fatalf("retention column missing: count=%d err=%v", retentionColumnCount, err)
+	}
 }

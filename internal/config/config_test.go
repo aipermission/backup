@@ -31,3 +31,16 @@ func TestLoadRejectsWeakToken(t *testing.T) {
 		t.Fatal("expected weak token to be rejected")
 	}
 }
+
+func TestLoadStorageQuota(t *testing.T) {
+	t.Setenv("AIPERMISSION_BACKUP_TOKEN_FILE", "")
+	t.Setenv("AIPERMISSION_BACKUP_TOKEN", "test-token-with-at-least-thirty-two-characters")
+	t.Setenv("AIPERMISSION_BACKUP_MAX_STORAGE_BYTES", "1048576")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxStorageBytes != 1048576 {
+		t.Fatalf("max storage bytes = %d", cfg.MaxStorageBytes)
+	}
+}
