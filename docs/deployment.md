@@ -29,6 +29,12 @@ Back up the Docker volume independently if service availability matters. The
 volume contains encrypted AIPermission snapshots and limited metadata, but its
 disclosure still allows offline guessing against weak database passwords.
 
+Set `AIPERMISSION_BACKUP_MAX_STORAGE_BYTES` when the service must enforce an
+application-level storage ceiling. Leave it unset for unlimited service quota;
+the host filesystem can still fill, so monitor both `/v1/storage` and the
+volume itself. Retention policy is stream-specific and does not replace an
+independent backup of the service volume.
+
 ## Upgrade
 
 1. Stop new uploads from AIPermission.

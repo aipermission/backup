@@ -9,6 +9,7 @@ services:
     environment:
       AIPERMISSION_BACKUP_LISTEN_ADDR: 0.0.0.0:8080
       AIPERMISSION_BACKUP_TOKEN_FILE: /run/secrets/backup_token
+      AIPERMISSION_BACKUP_MAX_STORAGE_BYTES: ${AIPERMISSION_BACKUP_MAX_STORAGE_BYTES:-}
     secrets:
       - backup_token
     group_add:
