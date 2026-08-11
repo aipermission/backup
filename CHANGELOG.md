@@ -2,6 +2,21 @@
 
 All notable changes to AIPermission Backup are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added authenticated storage usage/quota reporting and optional upload quota
+  enforcement.
+- Added per-stream automatic retention policies with a side-effect-free
+  preview and optional immediate application.
+
+### Security
+
+- Quota rejection leaves no backup metadata, automatic retention remains
+  bounded to 1-1000 newest versions, and every stream retains its latest
+  recovery version.
+
 ## [0.1.1] - 2026-08-01
 
 ### Added
