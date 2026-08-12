@@ -74,23 +74,10 @@ func (s *Server) deleteBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteBackups(w http.ResponseWriter, r *http.Request) {
-	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
-		return
-	}
 	var request struct {
 		BackupIDs []string `json:"backup_ids"`
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8192)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_delete_request", "request must contain 1 to 100 backup_ids")
-		return
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid_delete_request", "request must contain one JSON object")
+	if !decodeJSONRequest(w, r, 8192, &request, "invalid_delete_request", "request must contain 1 to 100 backup_ids") {
 		return
 	}
 	s.deleteBackupIDs(w, r, request.BackupIDs)
@@ -116,23 +103,10 @@ func (s *Server) deleteBackupIDs(w http.ResponseWriter, r *http.Request, backupI
 }
 
 func (s *Server) pruneBackups(w http.ResponseWriter, r *http.Request) {
-	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
-		return
-	}
 	var request struct {
 		KeepLatest int `json:"keep_latest"`
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_prune_request", "request must contain keep_latest between 1 and 1000")
-		return
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid_prune_request", "request must contain one JSON object")
+	if !decodeJSONRequest(w, r, 4096, &request, "invalid_prune_request", "request must contain keep_latest between 1 and 1000") {
 		return
 	}
 	result, err := s.store.PruneBackups(r.Context(), r.PathValue("stream_id"), request.KeepLatest)
@@ -149,6 +123,26 @@ func (s *Server) pruneBackups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func decodeJSONRequest(w http.ResponseWriter, r *http.Request, maxBytes int64, target any, errorCode, errorMessage string) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		writeError(w, http.StatusBadRequest, errorCode, errorMessage)
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, errorCode, "request must contain one JSON object")
+		return false
+	}
+	return true
 }
 
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {

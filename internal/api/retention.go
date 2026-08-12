@@ -1,10 +1,7 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
-	"mime"
 	"net/http"
 
 	"github.com/aipermission/backup/internal/store"
@@ -33,7 +30,7 @@ func (s *Server) previewRetention(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		KeepLatest int `json:"keep_latest"`
 	}
-	if !decodeRetentionRequest(w, r, &request) {
+	if !decodeJSONRequest(w, r, 4096, &request, "invalid_retention_request", "retention request is invalid") {
 		return
 	}
 	preview, err := s.store.PreviewRetention(r.Context(), r.PathValue("stream_id"), request.KeepLatest)
@@ -50,7 +47,7 @@ func (s *Server) updateRetention(w http.ResponseWriter, r *http.Request) {
 		KeepLatest int  `json:"keep_latest"`
 		ApplyNow   bool `json:"apply_now"`
 	}
-	if !decodeRetentionRequest(w, r, &request) {
+	if !decodeJSONRequest(w, r, 4096, &request, "invalid_retention_request", "retention request is invalid") {
 		return
 	}
 	result, err := s.store.SetRetentionPolicy(r.Context(), r.PathValue("stream_id"), request.Enabled, request.KeepLatest, request.ApplyNow)
@@ -59,26 +56,6 @@ func (s *Server) updateRetention(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
-}
-
-func decodeRetentionRequest(w http.ResponseWriter, r *http.Request, target any) bool {
-	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
-		return false
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_retention_request", "retention request is invalid")
-		return false
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid_retention_request", "request must contain one JSON object")
-		return false
-	}
-	return true
 }
 
 func (s *Server) writeRetentionError(w http.ResponseWriter, err error) {
