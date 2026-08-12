@@ -32,8 +32,10 @@ disclosure still allows offline guessing against weak database passwords.
 Set `AIPERMISSION_BACKUP_MAX_STORAGE_BYTES` when the service must enforce an
 application-level storage ceiling. Leave it unset for unlimited service quota;
 the host filesystem can still fill, so monitor both `/v1/storage` and the
-volume itself. Retention policy is stream-specific and does not replace an
-independent backup of the service volume.
+volume itself. A stream retention policy allows the next upload to use space
+that the same committed upload will reclaim from older versions; failed uploads
+do not prune those versions. Retention policy is stream-specific and does not
+replace an independent backup of the service volume.
 
 ## Upgrade
 
