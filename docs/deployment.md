@@ -37,6 +37,12 @@ that the same committed upload will reclaim from older versions; failed uploads
 do not prune those versions. Retention policy is stream-specific and does not
 replace an independent backup of the service volume.
 
+Retention reduces committed storage after a successful upload; it does not
+remove the temporary peak. Keep enough filesystem space for the current retained
+set plus one maximum-size incoming snapshot. Enabling `apply_now` can reclaim
+existing old versions immediately, but it is an explicit destructive operation
+and should be previewed first.
+
 ## Upgrade
 
 1. Stop new uploads from AIPermission.

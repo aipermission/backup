@@ -118,7 +118,7 @@ func (s *Store) SetRetentionPolicy(ctx context.Context, streamID string, enabled
 	return RetentionUpdateResult{Policy: policy, Preview: preview, DeletedCount: deletedCount}, nil
 }
 
-func (s *Store) applyConfiguredRetentionTx(ctx context.Context, tx *sql.Tx, streamID string) (int, error) {
+func (s *Store) applyConfiguredRetentionTx(ctx context.Context, tx *sql.Tx, streamID, protectedBackupID string) (int, error) {
 	var keepLatest sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `SELECT retention_keep_latest FROM backup_streams WHERE id = ?`, streamID).Scan(&keepLatest); err != nil {
 		return 0, fmt.Errorf("read configured backup retention: %w", err)
@@ -126,7 +126,7 @@ func (s *Store) applyConfiguredRetentionTx(ctx context.Context, tx *sql.Tx, stre
 	if !keepLatest.Valid {
 		return 0, nil
 	}
-	candidates, err := retentionCandidates(ctx, tx, streamID, int(keepLatest.Int64))
+	candidates, err := retentionCandidatesExcluding(ctx, tx, streamID, max(int(keepLatest.Int64)-1, 0), protectedBackupID)
 	if err != nil || len(candidates) == 0 {
 		return 0, err
 	}
@@ -179,14 +179,30 @@ func retentionPreview(ctx context.Context, query retentionQuerier, streamID stri
 }
 
 func retentionCandidates(ctx context.Context, query retentionQuerier, streamID string, keepLatest int) ([]deletionCandidate, error) {
+	return retentionCandidatesExcluding(ctx, query, streamID, keepLatest, "")
+}
+
+func retentionCandidatesExcluding(
+	ctx context.Context,
+	query retentionQuerier,
+	streamID string,
+	keepLatest int,
+	protectedBackupID string,
+) ([]deletionCandidate, error) {
 	// created_at is the user-visible ordering key; random IDs provide a stable tie-break
 	// when two backups share the same timestamp.
-	rows, err := query.QueryContext(ctx, `
+	queryText := `
 		SELECT id, storage_path, size_bytes
 		FROM backups
-		WHERE stream_id = ?
-		ORDER BY created_at DESC, id DESC
-		LIMIT -1 OFFSET ?`, streamID, keepLatest)
+		WHERE stream_id = ?`
+	args := []any{streamID}
+	if protectedBackupID != "" {
+		queryText += ` AND id <> ?`
+		args = append(args, protectedBackupID)
+	}
+	queryText += ` ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?`
+	args = append(args, keepLatest)
+	rows, err := query.QueryContext(ctx, queryText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list backups for retention: %w", err)
 	}

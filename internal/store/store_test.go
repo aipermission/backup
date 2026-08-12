@@ -409,6 +409,73 @@ func TestAutomaticRetentionMakesRoomWithinStorageQuota(t *testing.T) {
 	}
 }
 
+func TestAutomaticRetentionAlwaysProtectsTheIncomingBackup(t *testing.T) {
+	storage, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	ctx := context.Background()
+	times := []time.Time{
+		time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC),
+		time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC),
+		time.Date(2026, time.August, 2, 12, 0, 1, 0, time.UTC),
+	}
+	storage.now = func() time.Time {
+		value := times[0]
+		times = times[1:]
+		return value
+	}
+	first, err := storage.CreateBackup(ctx, "project-a", "Project A", "install-a", bytes.NewReader([]byte("first")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.SetRetentionPolicy(ctx, "project-a", true, 1, false); err != nil {
+		t.Fatal(err)
+	}
+	second, err := storage.CreateBackup(ctx, "project-a", "Project A", "install-a", bytes.NewReader([]byte("second")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := storage.ListBackups(ctx, "project-a", 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != second.ID || page.Items[0].ID == first.ID {
+		t.Fatalf("incoming backup was not protected from retention: %#v", page.Items)
+	}
+}
+
+func TestStoreRemovesOrphanedBlobsOnStartup(t *testing.T) {
+	dataDir := t.TempDir()
+	storage, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateBackup(context.Background(), "project-a", "Project A", "install-a", bytes.NewReader([]byte("valid"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	orphanPath := filepath.Join(dataDir, "blobs", "project-a", "orphan.aipdb")
+	if err := os.WriteFile(orphanPath, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	storage, err = Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	if _, err := os.Stat(orphanPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned blob was not removed: %v", err)
+	}
+	page, err := storage.ListBackups(context.Background(), "project-a", 10, "")
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("referenced backup was not preserved: items=%#v err=%v", page.Items, err)
+	}
+}
+
 func TestUnlimitedStorageAcceptsBackup(t *testing.T) {
 	storage, err := Open(t.TempDir())
 	if err != nil {

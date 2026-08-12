@@ -142,6 +142,10 @@ func Open(dataDir string, options ...Options) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := store.cleanupOrphanedBlobs(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return store, nil
 }
 
@@ -263,6 +267,48 @@ func (s *Store) cleanupPendingDeletions(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) cleanupOrphanedBlobs(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT storage_path FROM backups`)
+	if err != nil {
+		return fmt.Errorf("list referenced backup blobs: %w", err)
+	}
+	referenced := make(map[string]struct{})
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan referenced backup blob: %w", err)
+		}
+		referenced[filepath.Clean(path)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate referenced backup blobs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close referenced backup blobs: %w", err)
+	}
+	return filepath.WalkDir(s.blobDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("walk backup blob directory: %w", walkErr)
+		}
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".aipdb" {
+			return nil
+		}
+		relative, err := filepath.Rel(s.dataDir, path)
+		if err != nil {
+			return fmt.Errorf("resolve backup blob path: %w", err)
+		}
+		if _, ok := referenced[filepath.Clean(relative)]; ok {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove orphaned backup blob: %w", err)
+		}
+		return nil
+	})
 }
 
 func (s *Store) resolveStoragePath(storedPath string) (string, error) {
@@ -394,8 +440,11 @@ INSERT INTO backups(id, stream_id, source_installation_id, filename, size_bytes,
 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, id, streamID, sourceInstallationID, filename, size, digest, createdText, relativePath); err != nil {
 		return Backup{}, fmt.Errorf("store backup metadata: %w", err)
 	}
-	retentionDeleted, err := s.applyConfiguredRetentionTx(ctx, tx, streamID)
+	retentionDeleted, err := s.applyConfiguredRetentionTx(ctx, tx, streamID, id)
 	if err != nil {
+		return Backup{}, err
+	}
+	if err := s.ensureStorageQuotaTx(ctx, tx); err != nil {
 		return Backup{}, err
 	}
 	if err := tx.Commit(); err != nil {
