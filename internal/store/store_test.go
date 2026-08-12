@@ -212,6 +212,38 @@ func TestStoreDeletesSelectedBackupsAndProtectsLastVersion(t *testing.T) {
 	}
 }
 
+func TestStoreDeletionFailureRollsBackAndReleasesConnection(t *testing.T) {
+	storage, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { storage.Close() })
+	first, err := storage.CreateBackup(context.Background(), "rollback-db", "Rollback DB", "install-a", bytes.NewReader([]byte("first")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateBackup(context.Background(), "rollback-db", "Rollback DB", "install-a", bytes.NewReader([]byte("second"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.db.Exec(`
+		CREATE TRIGGER reject_pending_deletion BEFORE INSERT ON pending_blob_deletions
+		BEGIN SELECT RAISE(ABORT, 'injected deletion queue failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.DeleteBackups(context.Background(), "rollback-db", []string{first.ID}); err == nil {
+		t.Fatal("expected injected deletion queue failure")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var count int
+	if err := storage.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE stream_id = 'rollback-db'`).Scan(&count); err != nil {
+		t.Fatalf("database connection remained locked after rollback: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("backup count=%d, want both records after rollback", count)
+	}
+}
+
 func TestStoreDetectsCorruptionAndCleansTemporaryFiles(t *testing.T) {
 	dataDir := t.TempDir()
 	temporaryDir := filepath.Join(dataDir, "temporary")
@@ -264,6 +296,12 @@ func TestStoreRejectsNewerMetadataSchema(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsMultipleOptions(t *testing.T) {
+	if _, err := Open(t.TempDir(), Options{}, Options{}); err == nil {
+		t.Fatal("expected multiple options to be rejected")
+	}
+}
+
 func TestStoreMigratesVersionOneMetadata(t *testing.T) {
 	dataDir := t.TempDir()
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -295,5 +333,117 @@ func TestStoreMigratesVersionOneMetadata(t *testing.T) {
 	var retentionColumnCount int
 	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('backup_streams') WHERE name = 'retention_keep_latest'`).Scan(&retentionColumnCount); err != nil || retentionColumnCount != 1 {
 		t.Fatalf("retention column missing: count=%d err=%v", retentionColumnCount, err)
+	}
+}
+
+func TestStoreRecoversInterruptedVersionThreeMigration(t *testing.T) {
+	dataDir := t.TempDir()
+	metadata, err := sql.Open("sqlite", filepath.Join(dataDir, "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.Exec(`
+		CREATE TABLE backup_streams (
+			id TEXT PRIMARY KEY,
+			database_name TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			retention_keep_latest INTEGER CHECK(retention_keep_latest BETWEEN 1 AND 1000)
+		);
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := metadata.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	storage, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	var schemaVersion, retentionColumnCount int
+	if err := storage.db.QueryRow(`PRAGMA user_version`).Scan(&schemaVersion); err != nil || schemaVersion != SchemaVersion {
+		t.Fatalf("unexpected recovered schema version: version=%d err=%v", schemaVersion, err)
+	}
+	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('backup_streams') WHERE name = 'retention_keep_latest'`).Scan(&retentionColumnCount); err != nil || retentionColumnCount != 1 {
+		t.Fatalf("retention column duplicated or missing: count=%d err=%v", retentionColumnCount, err)
+	}
+}
+
+func TestAutomaticRetentionMakesRoomWithinStorageQuota(t *testing.T) {
+	storage, err := Open(t.TempDir(), Options{MaxStorageBytes: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	ctx := context.Background()
+	first, err := storage.CreateBackup(ctx, "project-a", "Project A", "install-a", bytes.NewReader([]byte("first")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.SetRetentionPolicy(ctx, "project-a", true, 1, false); err != nil {
+		t.Fatal(err)
+	}
+	second, err := storage.CreateBackup(ctx, "project-a", "Project A", "install-a", bytes.NewReader([]byte("later")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.RetentionDeletedCount != 1 {
+		t.Fatalf("expected automatic retention to delete one backup, got %#v", second)
+	}
+	page, err := storage.ListBackups(ctx, "project-a", 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != second.ID || page.Items[0].ID == first.ID {
+		t.Fatalf("unexpected retained backups: %#v", page.Items)
+	}
+	usage, err := storage.StorageUsage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.UsedBytes != 5 || usage.RemainingBytes == nil || *usage.RemainingBytes != 0 {
+		t.Fatalf("unexpected quota usage: %#v", usage)
+	}
+}
+
+func TestUnlimitedStorageAcceptsBackup(t *testing.T) {
+	storage, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	if _, err := storage.CreateBackup(context.Background(), "project-a", "Project A", "install-a", bytes.NewReader([]byte("backup"))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetentionPolicyBoundsAndMissingStream(t *testing.T) {
+	storage, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	ctx := context.Background()
+	if _, err := storage.SetRetentionPolicy(ctx, "missing", true, 1, false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing stream, got %v", err)
+	}
+	if _, err := storage.CreateBackup(ctx, "project-a", "Project A", "install-a", bytes.NewReader([]byte("first"))); err != nil {
+		t.Fatal(err)
+	}
+	for _, keepLatest := range []int{0, 1001} {
+		if _, err := storage.SetRetentionPolicy(ctx, "project-a", true, keepLatest, false); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("expected keep_latest=%d to be rejected, got %v", keepLatest, err)
+		}
+	}
+	for _, keepLatest := range []int{1, 1000} {
+		if _, err := storage.SetRetentionPolicy(ctx, "project-a", true, keepLatest, false); err != nil {
+			t.Fatalf("expected keep_latest=%d to be accepted: %v", keepLatest, err)
+		}
+	}
+	if _, err := storage.SetRetentionPolicy(ctx, "project-a", false, 0, false); err != nil {
+		t.Fatalf("expected disabled policy to ignore keep_latest: %v", err)
 	}
 }

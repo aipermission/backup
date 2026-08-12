@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"math"
 )
 
 type StorageUsage struct {
@@ -41,11 +44,44 @@ func (s *Store) StorageUsage(ctx context.Context) (StorageUsage, error) {
 
 func (s *Store) remainingStorageBytes(ctx context.Context) (int64, error) {
 	if s.maxStorageBytes == 0 {
-		return 0, nil
+		return math.MaxInt64, nil
 	}
 	usage, err := s.StorageUsage(ctx)
 	if err != nil {
 		return 0, err
 	}
 	return *usage.RemainingBytes, nil
+}
+
+func (s *Store) uploadAllowance(ctx context.Context, streamID string, remaining int64) (int64, error) {
+	if remaining == math.MaxInt64 {
+		return remaining, nil
+	}
+	var keepLatest sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT retention_keep_latest FROM backup_streams WHERE id = ?`, streamID).Scan(&keepLatest)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !keepLatest.Valid) {
+		return remaining, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read upload retention policy: %w", err)
+	}
+
+	// The incoming backup becomes the newest version, so only keep_latest-1 existing
+	// versions remain protected when configured retention runs after the insert.
+	candidates, err := retentionCandidates(ctx, s.db, streamID, max(int(keepLatest.Int64)-1, 0))
+	if err != nil {
+		return 0, err
+	}
+	var releasable int64
+	for _, candidate := range candidates {
+		if candidate.size > math.MaxInt64-releasable {
+			releasable = math.MaxInt64
+			break
+		}
+		releasable += candidate.size
+	}
+	if releasable > math.MaxInt64-remaining {
+		return math.MaxInt64, nil
+	}
+	return remaining + releasable, nil
 }
