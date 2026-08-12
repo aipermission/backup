@@ -104,9 +104,12 @@ contains the database password or decrypted database content.
 
 Exactly one token source is required. The token file takes precedence.
 When a storage quota is configured, uploads that cannot fit are rejected before
-metadata is created. Storage usage and remaining quota are available through
-the authenticated protocol; a failed usage request is never represented as an
-empty or healthy store.
+metadata is created. If automatic retention is enabled for the destination
+stream, the quota check includes bytes that the same successful upload will
+release by pruning older versions. Existing versions remain untouched when the
+new upload or its metadata transaction fails. Storage usage and remaining quota
+are available through the authenticated protocol; a failed usage request is
+never represented as an empty or healthy store.
 
 ## Protocol
 

@@ -47,6 +47,10 @@ error response; clients must not interpret a failed check as zero usage.
 
 An upload that exceeds the configured quota returns
 `507 storage_quota_exceeded` without creating stream or backup metadata.
+For streams with automatic retention, this check uses projected post-retention
+usage: versions that would be pruned by the same successful upload count as
+reclaimable space. The service still preserves the existing versions unless
+the new immutable version and its metadata commit successfully.
 
 ## Upload An Immutable Version
 
