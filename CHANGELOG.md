@@ -4,12 +4,21 @@ All notable changes to AIPermission Backup are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-12
+
 ### Added
 
 - Added authenticated storage usage/quota reporting and optional upload quota
   enforcement.
 - Added per-stream automatic retention policies with a side-effect-free
   preview and optional immediate application.
+
+### Changed
+
+- Advanced the authenticated service contract to protocol v2 with explicit
+  capability discovery and retention-aware storage metadata.
+- AIPermission clients that require protocol v2 intentionally reject older
+  backup services. Upgrade the backup service before the matching client.
 
 ### Security
 
