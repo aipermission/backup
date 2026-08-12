@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -96,6 +97,9 @@ func Open(dataDir string, options ...Options) (*Store, error) {
 	if strings.TrimSpace(dataDir) == "" {
 		return nil, errors.New("data directory is required")
 	}
+	if len(options) > 1 {
+		return nil, errors.New("only one store options value is supported")
+	}
 	dataDir, err := filepath.Abs(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve data directory: %w", err)
@@ -115,7 +119,7 @@ func Open(dataDir string, options ...Options) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	var opts Options
-	if len(options) > 0 {
+	if len(options) == 1 {
 		opts = options[0]
 	}
 	if opts.MaxStorageBytes < 0 {
@@ -181,14 +185,26 @@ CREATE TABLE IF NOT EXISTS pending_blob_deletions (
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("initialize metadata database: %w", err)
 	}
-	if schemaVersion < 3 {
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE backup_streams ADD COLUMN retention_keep_latest INTEGER CHECK(retention_keep_latest BETWEEN 1 AND 1000)`); err != nil {
-			return fmt.Errorf("add backup stream retention policy: %w", err)
-		}
-	}
 	if schemaVersion < SchemaVersion {
-		if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin metadata schema migration: %w", err)
+		}
+		defer tx.Rollback()
+		var retentionColumnCount int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('backup_streams') WHERE name = 'retention_keep_latest'`).Scan(&retentionColumnCount); err != nil {
+			return fmt.Errorf("inspect backup stream retention column: %w", err)
+		}
+		if retentionColumnCount == 0 {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE backup_streams ADD COLUMN retention_keep_latest INTEGER CHECK(retention_keep_latest BETWEEN 1 AND 1000)`); err != nil {
+				return fmt.Errorf("add backup stream retention policy: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
 			return fmt.Errorf("write metadata schema version: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit metadata schema migration: %w", err)
 		}
 	}
 	if err := s.cleanupPendingDeletions(ctx); err != nil {
@@ -277,7 +293,11 @@ func (s *Store) CreateBackup(ctx context.Context, streamID, databaseName, source
 	if err != nil {
 		return Backup{}, err
 	}
-	if s.maxStorageBytes > 0 && remaining == 0 {
+	uploadAllowance, err := s.uploadAllowance(ctx, streamID, remaining)
+	if err != nil {
+		return Backup{}, err
+	}
+	if uploadAllowance == 0 {
 		return Backup{}, ErrQuotaExceeded
 	}
 
@@ -300,8 +320,8 @@ func (s *Store) CreateBackup(ctx context.Context, streamID, databaseName, source
 
 	hash := sha256.New()
 	copySource := body
-	if s.maxStorageBytes > 0 {
-		copySource = io.LimitReader(body, remaining+1)
+	if uploadAllowance < math.MaxInt64 {
+		copySource = io.LimitReader(body, uploadAllowance+1)
 	}
 	size, err := io.Copy(io.MultiWriter(temporary, hash), copySource)
 	if err != nil {
@@ -310,7 +330,7 @@ func (s *Store) CreateBackup(ctx context.Context, streamID, databaseName, source
 	if size == 0 {
 		return Backup{}, fmt.Errorf("%w: backup body is empty", ErrInvalidInput)
 	}
-	if s.maxStorageBytes > 0 && size > remaining {
+	if size > uploadAllowance {
 		return Backup{}, ErrQuotaExceeded
 	}
 	if err := temporary.Sync(); err != nil {
@@ -554,30 +574,9 @@ func (s *Store) PruneBackups(ctx context.Context, streamID string, keepLatest in
 		return PruneResult{}, fmt.Errorf("read backup stream: %w", err)
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, storage_path
-FROM backups
-WHERE stream_id = ?
-ORDER BY created_at DESC, id DESC
-LIMIT -1 OFFSET ?`, streamID, keepLatest)
+	candidates, err := retentionCandidates(ctx, s.db, streamID, keepLatest)
 	if err != nil {
-		return PruneResult{}, fmt.Errorf("list backups to prune: %w", err)
-	}
-	var candidates []deletionCandidate
-	for rows.Next() {
-		var item deletionCandidate
-		if err := rows.Scan(&item.id, &item.path); err != nil {
-			rows.Close()
-			return PruneResult{}, fmt.Errorf("scan backup to prune: %w", err)
-		}
-		candidates = append(candidates, item)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return PruneResult{}, fmt.Errorf("iterate backups to prune: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return PruneResult{}, fmt.Errorf("close backups to prune: %w", err)
+		return PruneResult{}, err
 	}
 	if len(candidates) == 0 {
 		return PruneResult{StreamID: streamID, KeepLatest: keepLatest}, nil
@@ -668,13 +667,16 @@ func (s *Store) deleteCandidates(ctx context.Context, streamID string, candidate
 	if err != nil {
 		return fmt.Errorf("begin backup deletion transaction: %w", err)
 	}
+	defer tx.Rollback()
 	if err := queueDeletionCandidates(ctx, tx, streamID, candidates, s.now().UTC()); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit backup deletion: %w", err)
 	}
-	return s.cleanupPendingDeletions(ctx)
+	// Metadata is authoritative after commit; a later mutation retries pending blob cleanup.
+	_ = s.cleanupPendingDeletions(ctx)
+	return nil
 }
 
 func (s *Store) latestBackup(ctx context.Context, streamID, databaseName string) (Backup, error) {

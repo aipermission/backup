@@ -179,6 +179,8 @@ func retentionPreview(ctx context.Context, query retentionQuerier, streamID stri
 }
 
 func retentionCandidates(ctx context.Context, query retentionQuerier, streamID string, keepLatest int) ([]deletionCandidate, error) {
+	// created_at is the user-visible ordering key; random IDs provide a stable tie-break
+	// when two backups share the same timestamp.
 	rows, err := query.QueryContext(ctx, `
 		SELECT id, storage_path, size_bytes
 		FROM backups
