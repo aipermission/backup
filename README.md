@@ -118,7 +118,7 @@ never represented as an empty or healthy store.
 ## Protocol
 
 The versioned API is documented in [docs/api.md](docs/api.md). Mutation and
-listing requests require `X-AIPermission-Protocol-Version: 1`; `/v1/info` is the
+listing requests require `X-AIPermission-Protocol-Version: 2`; `/v1/info` is the
 authenticated compatibility discovery endpoint.
 
 ## Development

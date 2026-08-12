@@ -9,7 +9,7 @@ Authorization: Bearer <high-entropy-owner-token>
 All routes except `/v1/info` additionally require:
 
 ```http
-X-AIPermission-Protocol-Version: 1
+X-AIPermission-Protocol-Version: 2
 ```
 
 JSON failures use this shape:
@@ -59,7 +59,7 @@ POST /v1/streams/{stream_id}/backups
 Content-Type: application/octet-stream
 X-AIPermission-Database-Name: My Project
 X-AIPermission-Source-Installation-ID: install_d5dce07f
-X-AIPermission-Protocol-Version: 1
+X-AIPermission-Protocol-Version: 2
 
 <encrypted .aipdb bytes>
 ```
@@ -71,7 +71,7 @@ different display name returns `409 stream_conflict`.
 
 A successful response is `201 Created` with server-generated immutable backup
 metadata and a `Location` header. Retrying the same body creates another
-version; protocol v1 has no idempotency key. If automatic retention is enabled
+version; protocol v2 has no idempotency key. If automatic retention is enabled
 for the stream, `retention_deleted_count` reports how many older versions were
 pruned in the same metadata lifecycle.
 

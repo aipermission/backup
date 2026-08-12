@@ -16,7 +16,7 @@ import (
 	"github.com/aipermission/backup/internal/store"
 )
 
-const protocolVersion = "1"
+const protocolVersion = "2"
 
 type Config struct {
 	Token          string
@@ -266,7 +266,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 func (s *Server) protocol(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-AIPermission-Protocol-Version") != protocolVersion {
-			writeError(w, http.StatusUpgradeRequired, "protocol_mismatch", "X-AIPermission-Protocol-Version must be 1")
+			writeError(w, http.StatusUpgradeRequired, "protocol_mismatch", "X-AIPermission-Protocol-Version must be "+protocolVersion)
 			return
 		}
 		next.ServeHTTP(w, r)
