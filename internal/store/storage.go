@@ -85,3 +85,17 @@ func (s *Store) uploadAllowance(ctx context.Context, streamID string, remaining 
 	}
 	return remaining + releasable, nil
 }
+
+func (s *Store) ensureStorageQuotaTx(ctx context.Context, tx *sql.Tx) error {
+	if s.maxStorageBytes == 0 {
+		return nil
+	}
+	var used int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(size_bytes), 0) FROM backups`).Scan(&used); err != nil {
+		return fmt.Errorf("verify backup storage quota: %w", err)
+	}
+	if used > s.maxStorageBytes {
+		return ErrQuotaExceeded
+	}
+	return nil
+}
