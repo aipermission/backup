@@ -16,7 +16,7 @@ import (
 	"github.com/aipermission/backup/internal/store"
 )
 
-const protocolVersion = "2"
+const protocolVersion = "3"
 
 type Config struct {
 	Token          string
@@ -63,7 +63,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"service":          "aipermission-backup",
 		"version":          s.config.Version,
 		"protocol_version": protocolVersion,
-		"capabilities":     []string{"immutable_upload", "list_streams", "list_versions", "download", "prune_versions", "delete_versions", "storage_usage", "automatic_retention"},
+		"capabilities":     []string{"immutable_upload", "idempotent_upload", "list_streams", "list_versions", "download", "prune_versions", "delete_versions", "storage_usage", "automatic_retention"},
 		"max_upload_bytes": s.config.MaxUploadBytes,
 		"storage_schema":   store.SchemaVersion,
 	})
@@ -153,8 +153,9 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	}
 	databaseName := strings.TrimSpace(r.Header.Get("X-AIPermission-Database-Name"))
 	sourceID := strings.TrimSpace(r.Header.Get("X-AIPermission-Source-Installation-ID"))
-	if databaseName == "" || sourceID == "" {
-		writeError(w, http.StatusBadRequest, "metadata_required", "database name and source installation id headers are required")
+	operationID := strings.TrimSpace(r.Header.Get("X-AIPermission-Operation-ID"))
+	if databaseName == "" || sourceID == "" || operationID == "" {
+		writeError(w, http.StatusBadRequest, "metadata_required", "database name, source installation id, and operation id headers are required")
 		return
 	}
 	if r.ContentLength > s.config.MaxUploadBytes {
@@ -162,12 +163,14 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, s.config.MaxUploadBytes)
-	backup, err := s.store.CreateBackup(r.Context(), r.PathValue("stream_id"), databaseName, sourceID, r.Body)
+	backup, created, err := s.store.CreateBackupIdempotent(r.Context(), r.PathValue("stream_id"), databaseName, sourceID, operationID, r.Body)
 	if err != nil {
 		var maxBytesError *http.MaxBytesError
 		switch {
 		case errors.Is(err, store.ErrStreamConflict):
 			writeError(w, http.StatusConflict, "stream_conflict", err.Error())
+		case errors.Is(err, store.ErrOperationConflict):
+			writeError(w, http.StatusConflict, "operation_conflict", err.Error())
 		case errors.As(err, &maxBytesError):
 			writeError(w, http.StatusRequestEntityTooLarge, "upload_too_large", "backup exceeds the configured upload limit")
 		case errors.Is(err, store.ErrInvalidInput):
@@ -181,7 +184,11 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Location", fmt.Sprintf("/v1/streams/%s/backups/%s", backup.StreamID, backup.ID))
-	writeJSON(w, http.StatusCreated, backup)
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, backup)
 }
 
 func (s *Server) listStreams(w http.ResponseWriter, r *http.Request) {

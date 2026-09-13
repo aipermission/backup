@@ -7,12 +7,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aipermission/backup/internal/store"
 )
 
 const testToken = "test-token-with-at-least-thirty-two-characters"
+
+var testOperationSequence atomic.Uint64
 
 func TestBackupLifecycleAndAuthentication(t *testing.T) {
 	server := newTestServer(t, 1024)
@@ -81,6 +85,35 @@ func TestProtocolAndUploadLimits(t *testing.T) {
 	server.ServeHTTP(response, request)
 	if response.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestUploadOperationIDDeduplicatesLostResponses(t *testing.T) {
+	server := newTestServer(t, 1024)
+	upload := func(payload string) *httptest.ResponseRecorder {
+		request := authorizedRequest(http.MethodPost, "/v1/streams/project-a/backups", bytes.NewBufferString(payload))
+		request.Header.Set("Content-Type", "application/octet-stream")
+		request.Header.Set("X-AIPermission-Database-Name", "Project A")
+		request.Header.Set("X-AIPermission-Source-Installation-ID", "install-a")
+		request.Header.Set("X-AIPermission-Operation-ID", "stable-operation")
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		return response
+	}
+	first := upload("encrypted-backup")
+	second := upload("body-is-ignored-for-a-replay")
+	if first.Code != http.StatusCreated || second.Code != http.StatusOK {
+		t.Fatalf("unexpected statuses: first=%d second=%d", first.Code, second.Code)
+	}
+	var firstBackup, secondBackup store.Backup
+	if err := json.NewDecoder(first.Body).Decode(&firstBackup); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewDecoder(second.Body).Decode(&secondBackup); err != nil {
+		t.Fatal(err)
+	}
+	if firstBackup.ID != secondBackup.ID {
+		t.Fatalf("idempotent replay returned different backups: %q != %q", firstBackup.ID, secondBackup.ID)
 	}
 }
 
@@ -227,5 +260,6 @@ func authorizedRequest(method, target string, body io.Reader) *http.Request {
 	request := httptest.NewRequest(method, target, body)
 	request.Header.Set("Authorization", "Bearer "+testToken)
 	request.Header.Set("X-AIPermission-Protocol-Version", protocolVersion)
+	request.Header.Set("X-AIPermission-Operation-ID", "test-operation-"+strconv.FormatUint(testOperationSequence.Add(1), 10))
 	return request
 }
