@@ -97,6 +97,30 @@ func TestStoreRejectsConflictingStreamAndRemovesBlob(t *testing.T) {
 	}
 }
 
+func TestIdempotentUploadReturnsCommittedBackupWithoutCreatingAnotherVersion(t *testing.T) {
+	storage, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { storage.Close() })
+
+	first, created, err := storage.CreateBackupIdempotent(context.Background(), "project-a", "Project A", "install-a", "operation-a", bytes.NewReader([]byte("first")))
+	if err != nil || !created {
+		t.Fatalf("first upload: created=%v err=%v", created, err)
+	}
+	replayed, created, err := storage.CreateBackupIdempotent(context.Background(), "project-a", "Project A", "install-a", "operation-a", bytes.NewReader([]byte("different-body-is-not-consumed")))
+	if err != nil || created || replayed.ID != first.ID {
+		t.Fatalf("replayed upload: backup=%#v created=%v err=%v", replayed, created, err)
+	}
+	page, err := storage.ListBackups(context.Background(), "project-a", 10, "")
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("idempotent upload created duplicate versions: items=%#v err=%v", page.Items, err)
+	}
+	if _, _, err := storage.CreateBackupIdempotent(context.Background(), "project-a", "Project A", "install-b", "operation-a", bytes.NewReader([]byte("second"))); !errors.Is(err, ErrOperationConflict) {
+		t.Fatalf("expected operation metadata conflict, got %v", err)
+	}
+}
+
 func TestStorePrunesOldBackupsAndPreservesLatestVersions(t *testing.T) {
 	storage, err := Open(t.TempDir())
 	if err != nil {

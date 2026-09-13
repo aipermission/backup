@@ -1,4 +1,4 @@
-# Backup Protocol v1
+# Backup Protocol v3
 
 All `/v1` routes require:
 
@@ -9,7 +9,7 @@ Authorization: Bearer <high-entropy-owner-token>
 All routes except `/v1/info` additionally require:
 
 ```http
-X-AIPermission-Protocol-Version: 2
+X-AIPermission-Protocol-Version: 3
 ```
 
 JSON failures use this shape:
@@ -59,7 +59,8 @@ POST /v1/streams/{stream_id}/backups
 Content-Type: application/octet-stream
 X-AIPermission-Database-Name: My Project
 X-AIPermission-Source-Installation-ID: install_d5dce07f
-X-AIPermission-Protocol-Version: 2
+X-AIPermission-Operation-ID: upload_0197eec9
+X-AIPermission-Protocol-Version: 3
 
 <encrypted .aipdb bytes>
 ```
@@ -69,11 +70,16 @@ digits, dots, underscores, or hyphens and must start with a letter or digit.
 The display name is limited to 128 characters. Reusing a stream with a
 different display name returns `409 stream_conflict`.
 
-A successful response is `201 Created` with server-generated immutable backup
-metadata and a `Location` header. Retrying the same body creates another
-version; protocol v2 has no idempotency key. If automatic retention is enabled
-for the stream, `retention_deleted_count` reports how many older versions were
-pruned in the same metadata lifecycle.
+A successful first response is `201 Created` with server-generated immutable
+backup metadata and a `Location` header. The client-generated operation ID is
+stored atomically with that version. Replaying the same operation and metadata
+returns the original version with `200 OK` without consuming the request body
+or creating another immutable version. Reusing an operation ID with different
+stream, database, or source metadata returns `409 operation_conflict`.
+
+If automatic retention is enabled for the stream,
+`retention_deleted_count` reports how many older versions were pruned in the
+same metadata lifecycle.
 
 ## List Streams And Versions
 
