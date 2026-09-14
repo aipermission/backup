@@ -4,6 +4,26 @@ All notable changes to AIPermission Backup are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-14
+
+### Changed
+
+- Advanced the authenticated service contract to protocol v3 and require a
+  client-generated operation ID for every immutable upload.
+- Replaying the same upload operation now returns the original backup version
+  without consuming the request body or creating a duplicate version.
+- Reusing an operation ID with different stream or source metadata is rejected
+  as an explicit conflict.
+- AIPermission clients that require protocol v3 intentionally reject older
+  backup services. Publish or deploy this service before upgrading the matching
+  AIPermission client, then upgrade both sides as one coordinated change.
+
+### Security
+
+- Upload operation identities are stored atomically with backup metadata and
+  protected by a unique database constraint, so a lost response cannot cause a
+  second immutable backup during a retry.
+
 ## [0.2.0] - 2026-08-12
 
 ### Added
