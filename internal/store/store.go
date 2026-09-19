@@ -183,8 +183,6 @@ CREATE TABLE IF NOT EXISTS backups (
 );
 CREATE INDEX IF NOT EXISTS idx_backups_stream_created
   ON backups(stream_id, created_at DESC, id DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_backups_operation_key
-  ON backups(operation_key) WHERE operation_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS pending_blob_deletions (
   storage_path TEXT PRIMARY KEY,
   queued_at TEXT NOT NULL
@@ -226,6 +224,9 @@ CREATE TABLE IF NOT EXISTS pending_blob_deletions (
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit metadata schema migration: %w", err)
 		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_backups_operation_key ON backups(operation_key) WHERE operation_key IS NOT NULL`); err != nil {
+		return fmt.Errorf("ensure backup operation key index: %w", err)
 	}
 	if err := s.cleanupPendingDeletions(ctx); err != nil {
 		return err

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -357,6 +358,71 @@ func TestStoreMigratesVersionOneMetadata(t *testing.T) {
 	var retentionColumnCount int
 	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('backup_streams') WHERE name = 'retention_keep_latest'`).Scan(&retentionColumnCount); err != nil || retentionColumnCount != 1 {
 		t.Fatalf("retention column missing: count=%d err=%v", retentionColumnCount, err)
+	}
+}
+
+func TestStoreMigratesPopulatedHistoricalMetadata(t *testing.T) {
+	for _, schemaVersion := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("version-%d", schemaVersion), func(t *testing.T) {
+			dataDir := t.TempDir()
+			metadata, err := sql.Open("sqlite", filepath.Join(dataDir, "metadata.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			retentionColumn := ""
+			if schemaVersion >= 2 {
+				retentionColumn = ", retention_keep_latest INTEGER CHECK(retention_keep_latest BETWEEN 1 AND 1000)"
+			}
+			fixture := fmt.Sprintf(`
+				CREATE TABLE backup_streams (
+					id TEXT PRIMARY KEY,
+					database_name TEXT NOT NULL,
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL%s
+				);
+				CREATE TABLE backups (
+					id TEXT PRIMARY KEY,
+					stream_id TEXT NOT NULL REFERENCES backup_streams(id),
+					source_installation_id TEXT NOT NULL,
+					filename TEXT NOT NULL,
+					size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+					sha256 TEXT NOT NULL,
+					created_at TEXT NOT NULL,
+					storage_path TEXT NOT NULL UNIQUE
+				);
+				INSERT INTO backup_streams(id, database_name, created_at, updated_at)
+				VALUES ('stream-a', 'Database A', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+				INSERT INTO backups(id, stream_id, source_installation_id, filename, size_bytes, sha256, created_at, storage_path)
+				VALUES ('backup-a', 'stream-a', 'install-a', 'backup.aipdb', 7, 'sha', '2026-01-01T00:00:00Z', 'stream-a/backup.aipdb');
+				PRAGMA user_version = %d;
+			`, retentionColumn, schemaVersion)
+			if _, err := metadata.Exec(fixture); err != nil {
+				t.Fatal(err)
+			}
+			if err := metadata.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			storage, err := Open(dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer storage.Close()
+
+			var migratedVersion, operationKeyColumnCount, operationKeyIndexCount, rowCount int
+			if err := storage.db.QueryRow(`PRAGMA user_version`).Scan(&migratedVersion); err != nil || migratedVersion != SchemaVersion {
+				t.Fatalf("unexpected schema version: version=%d err=%v", migratedVersion, err)
+			}
+			if err := storage.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('backups') WHERE name = 'operation_key'`).Scan(&operationKeyColumnCount); err != nil || operationKeyColumnCount != 1 {
+				t.Fatalf("operation key column missing: count=%d err=%v", operationKeyColumnCount, err)
+			}
+			if err := storage.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_backups_operation_key'`).Scan(&operationKeyIndexCount); err != nil || operationKeyIndexCount != 1 {
+				t.Fatalf("operation key index missing: count=%d err=%v", operationKeyIndexCount, err)
+			}
+			if err := storage.db.QueryRow(`SELECT COUNT(*) FROM backups WHERE id = 'backup-a' AND operation_key IS NULL`).Scan(&rowCount); err != nil || rowCount != 1 {
+				t.Fatalf("historical backup row not preserved: count=%d err=%v", rowCount, err)
+			}
+		})
 	}
 }
 
