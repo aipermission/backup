@@ -1,4 +1,4 @@
-# Backup Protocol v3
+# Backup Protocol v4
 
 All `/v1` routes require:
 
@@ -9,7 +9,7 @@ Authorization: Bearer <high-entropy-owner-token>
 All routes except `/v1/info` additionally require:
 
 ```http
-X-AIPermission-Protocol-Version: 3
+X-AIPermission-Protocol-Version: 4
 ```
 
 JSON failures use this shape:
@@ -32,7 +32,9 @@ GET /v1/info
 
 `/healthz` is intentionally unauthenticated and returns only service health.
 `/v1/info` returns the service version, protocol version, storage schema,
-capabilities, and maximum upload size.
+capabilities, and maximum upload size. Protocol 4 requires the
+`upload_operation_tombstones` capability so a retry cannot silently create a
+new version after the original upload result has expired.
 
 ## Storage Usage And Quota
 
@@ -60,7 +62,7 @@ Content-Type: application/octet-stream
 X-AIPermission-Database-Name: My Project
 X-AIPermission-Source-Installation-ID: install_d5dce07f
 X-AIPermission-Operation-ID: upload_0197eec9
-X-AIPermission-Protocol-Version: 3
+X-AIPermission-Protocol-Version: 4
 
 <encrypted .aipdb bytes>
 ```
@@ -134,6 +136,12 @@ The service verifies the stored byte size and SHA-256 before returning
 `application/octet-stream`. `X-AIPermission-SHA256` contains the lowercase hex
 digest. Missing blobs or digest mismatches return `409 backup_corrupt` rather
 than unverified content.
+
+Accepted upload operation keys are permanent idempotency identities. If
+retention or explicit deletion removes the referenced backup, every later retry
+returns `410 operation_expired` without consuming the request body or creating
+another version. The key cannot be reused for a different upload. Operation
+records for backups that still exist continue to replay the original result.
 
 ## Prune Old Versions
 

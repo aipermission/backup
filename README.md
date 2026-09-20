@@ -53,7 +53,7 @@ raw service port private. For access across the internet, use a VPN or private
 overlay network rather than exposing the service port directly. AIPermission
 rejects plaintext non-loopback provider URLs.
 
-The release Compose file defaults to the pinned `0.3.0` image. Set
+The release Compose file defaults to the pinned `0.4.0` image. Set
 `AIPERMISSION_BACKUP_VERSION` explicitly when upgrading. Contributors can use
 `docker compose up -d --build` to build the development image from source.
 
@@ -118,7 +118,7 @@ never represented as an empty or healthy store.
 ## Protocol
 
 The versioned API is documented in [docs/api.md](docs/api.md). Mutation and
-listing requests require `X-AIPermission-Protocol-Version: 3`; `/v1/info` is the
+listing requests require `X-AIPermission-Protocol-Version: 4`; `/v1/info` is the
 authenticated compatibility discovery endpoint.
 
 ## Development

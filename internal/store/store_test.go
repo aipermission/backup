@@ -159,6 +159,129 @@ func (r *clockAdvancingReader) Read(destination []byte) (int, error) {
 	}
 	return r.reader.Read(destination)
 }
+
+func TestIdempotentUploadTombstoneSurvivesRetentionAndRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	storage, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	first, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "operation-first", bytes.NewReader([]byte("first")))
+	if err != nil || !created {
+		t.Fatalf("first upload: created=%v err=%v", created, err)
+	}
+	if _, err := storage.SetRetentionPolicy(ctx, "project-a", true, 1, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "operation-second", bytes.NewReader([]byte("second"))); err != nil || !created {
+		t.Fatalf("second upload: created=%v err=%v", created, err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	storage, err = Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	body := bytes.NewReader([]byte("must-not-be-consumed"))
+	if _, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "operation-first", body); !errors.Is(err, ErrOperationExpired) || created {
+		t.Fatalf("expired replay: created=%v err=%v", created, err)
+	}
+	if body.Len() != len("must-not-be-consumed") {
+		t.Fatalf("expired replay consumed %d body bytes", len("must-not-be-consumed")-body.Len())
+	}
+	if _, _, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "different-install", "operation-first", bytes.NewReader([]byte("third"))); !errors.Is(err, ErrOperationConflict) {
+		t.Fatalf("expired operation metadata drift = %v, want conflict", err)
+	}
+	page, err := storage.ListBackups(ctx, "project-a", 10, "")
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID == first.ID {
+		t.Fatalf("backups after expired replay = %#v, err=%v", page.Items, err)
+	}
+	var operations int
+	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM backup_upload_operations`).Scan(&operations); err != nil || operations != 2 {
+		t.Fatalf("operation tombstones = %d, err=%v", operations, err)
+	}
+}
+
+func TestExpiredUploadTombstonePermanentlyPreventsOperationKeyReuse(t *testing.T) {
+	storage, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	ctx := context.Background()
+	now := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	storage.now = func() time.Time { return now }
+	first, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "expired-operation", bytes.NewReader([]byte("first")))
+	if err != nil || !created {
+		t.Fatalf("create first backup: created=%v err=%v", created, err)
+	}
+	now = now.Add(time.Second)
+	live, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "live-operation", bytes.NewReader([]byte("second")))
+	if err != nil || !created {
+		t.Fatalf("create live backup: created=%v err=%v", created, err)
+	}
+	if _, err := storage.DeleteBackups(ctx, "project-a", []string{first.ID}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.AddDate(10, 0, 0)
+	body := bytes.NewReader([]byte("replacement"))
+	if _, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "expired-operation", body); !errors.Is(err, ErrOperationExpired) || created {
+		t.Fatalf("reuse expired operation: created=%v err=%v", created, err)
+	}
+	if body.Len() != len("replacement") {
+		t.Fatalf("expired operation consumed %d body bytes", len("replacement")-body.Len())
+	}
+	replayed, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "live-operation", bytes.NewReader([]byte("ignored")))
+	if err != nil || created || replayed.ID != live.ID {
+		t.Fatalf("live operation replay: backup=%#v created=%v err=%v", replayed, created, err)
+	}
+	var operations int
+	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM backup_upload_operations`).Scan(&operations); err != nil || operations != 2 {
+		t.Fatalf("retained operation tombstones = %d, err=%v", operations, err)
+	}
+}
+
+func TestOpenRetainsOldUploadTombstones(t *testing.T) {
+	dataDir := t.TempDir()
+	storage, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	first, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "old-operation", bytes.NewReader([]byte("first")))
+	if err != nil || !created {
+		t.Fatalf("create first backup: created=%v err=%v", created, err)
+	}
+	if _, err := storage.CreateBackup(ctx, "project-a", "Project A", "install-a", bytes.NewReader([]byte("second"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.DeleteBackups(ctx, "project-a", []string{first.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.db.Exec(`UPDATE backup_upload_operations SET created_at = '2000-01-01T00:00:00.000000000Z' WHERE operation_key = 'old-operation'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	storage, err = Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	var count int
+	if err := storage.db.QueryRow(`SELECT COUNT(*) FROM backup_upload_operations WHERE operation_key = 'old-operation'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("retained operation count=%d err=%v", count, err)
+	}
+	if _, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "old-operation", bytes.NewReader([]byte("replacement"))); !errors.Is(err, ErrOperationExpired) || created {
+		t.Fatalf("old operation replay: created=%v err=%v", created, err)
+	}
+}
+
 func TestStorePrunesOldBackupsAndPreservesLatestVersions(t *testing.T) {
 	storage, err := Open(t.TempDir())
 	if err != nil {
@@ -497,10 +620,10 @@ func TestStoreNormalizesHistoricalTimestampsBeforeOrdering(t *testing.T) {
 		);
 		INSERT INTO backup_streams(id, database_name, created_at, updated_at)
 		VALUES ('stream-a', 'Database A', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.11Z');
-		INSERT INTO backups(id, stream_id, source_installation_id, filename, size_bytes, sha256, created_at, storage_path)
+		INSERT INTO backups(id, stream_id, source_installation_id, filename, size_bytes, sha256, created_at, storage_path, operation_key)
 		VALUES
-			('older-z', 'stream-a', 'install-a', 'older.aipdb', 1, 'sha', '2026-01-01T00:00:00.1Z', 'blobs/stream-a/older-z.aipdb'),
-			('newer-a', 'stream-a', 'install-a', 'newer.aipdb', 1, 'sha', '2026-01-01T00:00:00.11Z', 'blobs/stream-a/newer-a.aipdb');
+			('older-z', 'stream-a', 'install-a', 'older.aipdb', 1, 'sha', '2026-01-01T00:00:00.1Z', 'blobs/stream-a/older-z.aipdb', 'historical-operation'),
+			('newer-a', 'stream-a', 'install-a', 'newer.aipdb', 1, 'sha', '2026-01-01T00:00:00.11Z', 'blobs/stream-a/newer-a.aipdb', NULL);
 		PRAGMA user_version = 4;
 	`); err != nil {
 		metadata.Close()
@@ -560,6 +683,16 @@ func TestStoreNormalizesHistoricalTimestampsBeforeOrdering(t *testing.T) {
 	if len(candidates) != 1 || candidates[0].id != "older-z" {
 		t.Fatalf("retention candidates = %#v, want older-z", candidates)
 	}
+	var operationStream, operationDatabase, operationSource, operationBackup string
+	if err := storage.db.QueryRow(`
+		SELECT stream_id, database_name, source_installation_id, backup_id
+		FROM backup_upload_operations WHERE operation_key = 'historical-operation'`,
+	).Scan(&operationStream, &operationDatabase, &operationSource, &operationBackup); err != nil {
+		t.Fatal(err)
+	}
+	if operationStream != "stream-a" || operationDatabase != "Database A" || operationSource != "install-a" || operationBackup != "older-z" {
+		t.Fatalf("migrated operation = %q %q %q %q", operationStream, operationDatabase, operationSource, operationBackup)
+	}
 }
 
 func TestStoreRejectsUnparseableHistoricalTimestamp(t *testing.T) {
@@ -588,6 +721,56 @@ func TestStoreRejectsUnparseableHistoricalTimestamp(t *testing.T) {
 	if storage, err := Open(dataDir); err == nil {
 		storage.Close()
 		t.Fatal("expected malformed historical timestamp to reject migration")
+	}
+}
+
+func TestFailedMigrationRollsBackSchemaChanges(t *testing.T) {
+	dataDir := t.TempDir()
+	metadataPath := filepath.Join(dataDir, "metadata.db")
+	metadata, err := sql.Open("sqlite", metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.Exec(`
+		CREATE TABLE backup_streams (
+			id TEXT PRIMARY KEY,
+			database_name TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		INSERT INTO backup_streams(id, database_name, created_at, updated_at)
+		VALUES ('stream-a', 'Database A', 'not-a-timestamp', '2026-01-01T00:00:00Z');
+		PRAGMA user_version = 4;
+	`); err != nil {
+		metadata.Close()
+		t.Fatal(err)
+	}
+	if err := metadata.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if storage, err := Open(dataDir); err == nil {
+		storage.Close()
+		t.Fatal("expected malformed migration to fail")
+	}
+
+	metadata, err = sql.Open("sqlite", metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer metadata.Close()
+	var schemaVersion, uploadTables, retentionColumns int
+	if err := metadata.QueryRow(`PRAGMA user_version`).Scan(&schemaVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := metadata.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'backup_upload_operations'`).Scan(&uploadTables); err != nil {
+		t.Fatal(err)
+	}
+	if err := metadata.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('backup_streams') WHERE name = 'retention_keep_latest'`).Scan(&retentionColumns); err != nil {
+		t.Fatal(err)
+	}
+	if schemaVersion != 4 || uploadTables != 0 || retentionColumns != 0 {
+		t.Fatalf("failed migration persisted schema: version=%d upload_tables=%d retention_columns=%d", schemaVersion, uploadTables, retentionColumns)
 	}
 }
 
@@ -729,8 +912,10 @@ func TestAutomaticRetentionAlwaysProtectsTheIncomingBackup(t *testing.T) {
 	ctx := context.Background()
 	times := []time.Time{
 		time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC),
-		time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC),
+		time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC),
 		time.Date(2026, time.August, 2, 12, 0, 1, 0, time.UTC),
+		time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC),
+		time.Date(2026, time.August, 2, 12, 0, 2, 0, time.UTC),
 	}
 	storage.now = func() time.Time {
 		value := times[0]

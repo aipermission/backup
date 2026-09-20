@@ -4,6 +4,18 @@ All notable changes to AIPermission Backup are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Advanced the authenticated service contract to protocol v4 and pinned the
+  release Compose example to the matching `0.4.0` service image.
+- Expired upload operation identities now remain as durable tombstones, so a
+  delayed retry cannot create a new backup after the original version is gone.
+
+### Security
+
+- Historical metadata migrations now preserve canonical timestamps and run
+  under restrictive directory permissions before snapshots are created.
+
 ## [0.3.0] - 2026-09-14
 
 ### Changed

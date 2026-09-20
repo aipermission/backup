@@ -53,6 +53,10 @@ and should be previewed first.
    `/healthz`.
 5. Verify `/v1/info` protocol compatibility before resuming uploads.
 
+Protocol 4 is the minimum compatible protocol for current AIPermission
+clients. It makes retained upload-operation tombstones part of the wire
+contract; older daemons are rejected before a client prepares a new upload.
+
 Before changing an existing metadata schema, the service creates a durable
 `metadata.pre-migration-v<version>.db` snapshot beside `metadata.db`. Keep that
 file until the upgraded service has been verified, but treat it as diagnostic

@@ -1,6 +1,6 @@
 services:
   backup:
-    image: ghcr.io/aipermission/backup:${AIPERMISSION_BACKUP_VERSION:-0.3.0}
+    image: ghcr.io/aipermission/backup:${AIPERMISSION_BACKUP_VERSION:-0.4.0}
     restart: unless-stopped
     stop_grace_period: 20s
     environment:

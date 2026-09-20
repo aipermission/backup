@@ -7,7 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -17,6 +20,65 @@ import (
 const testToken = "test-token-with-at-least-thirty-two-characters"
 
 var testOperationSequence atomic.Uint64
+
+func TestInfoRequiresAuthenticationAndPublishesExactProtocolContract(t *testing.T) {
+	server := newTestServer(t, 1024)
+	request := httptest.NewRequest(http.MethodGet, "/v1/info", nil)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/v1/info", nil)
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("authenticated status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	if response.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("content type = %q, want application/json", response.Header().Get("Content-Type"))
+	}
+	payload := response.Body.Bytes()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 6 {
+		t.Fatalf("info fields = %v, want exact six-field contract", fields)
+	}
+	var info struct {
+		Service         string   `json:"service"`
+		Version         string   `json:"version"`
+		ProtocolVersion string   `json:"protocol_version"`
+		Capabilities    []string `json:"capabilities"`
+		MaxUploadBytes  int64    `json:"max_upload_bytes"`
+		StorageSchema   int      `json:"storage_schema"`
+	}
+	if err := json.Unmarshal(payload, &info); err != nil {
+		t.Fatal(err)
+	}
+	wantCapabilities := []string{
+		"immutable_upload", "idempotent_upload", "upload_operation_tombstones", "list_streams", "list_versions",
+		"download", "prune_versions", "delete_versions", "storage_usage", "automatic_retention",
+	}
+	if info.Service != "aipermission-backup" || info.Version != "test" || info.ProtocolVersion != protocolVersion ||
+		info.MaxUploadBytes != 1024 || info.StorageSchema != store.SchemaVersion || !reflect.DeepEqual(info.Capabilities, wantCapabilities) {
+		t.Fatalf("unexpected info contract: %#v", info)
+	}
+}
+
+func TestReleaseComposePinMatchesProtocolVersion(t *testing.T) {
+	compose, err := os.ReadFile("../../docker-compose.release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "AIPERMISSION_BACKUP_VERSION:-0." + protocolVersion + ".0"
+	if !strings.Contains(string(compose), want) {
+		t.Fatalf("release Compose does not pin the protocol %s service image; want %q", protocolVersion, want)
+	}
+}
 
 func TestBackupLifecycleAndAuthentication(t *testing.T) {
 	server := newTestServer(t, 1024)
@@ -114,6 +176,40 @@ func TestUploadOperationIDDeduplicatesLostResponses(t *testing.T) {
 	}
 	if firstBackup.ID != secondBackup.ID {
 		t.Fatalf("idempotent replay returned different backups: %q != %q", firstBackup.ID, secondBackup.ID)
+	}
+}
+
+func TestUploadOperationReturnsGoneAfterBackupDeletion(t *testing.T) {
+	server := newTestServer(t, 1024)
+	upload := func(operationID, payload string) *httptest.ResponseRecorder {
+		request := authorizedRequest(http.MethodPost, "/v1/streams/project-a/backups", bytes.NewBufferString(payload))
+		request.Header.Set("Content-Type", "application/octet-stream")
+		request.Header.Set("X-AIPermission-Database-Name", "Project A")
+		request.Header.Set("X-AIPermission-Source-Installation-ID", "install-a")
+		request.Header.Set("X-AIPermission-Operation-ID", operationID)
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		return response
+	}
+	first := upload("deleted-operation", "first")
+	second := upload("retained-operation", "second")
+	if first.Code != http.StatusCreated || second.Code != http.StatusCreated {
+		t.Fatalf("upload statuses: first=%d second=%d", first.Code, second.Code)
+	}
+	var firstBackup store.Backup
+	if err := json.NewDecoder(first.Body).Decode(&firstBackup); err != nil {
+		t.Fatal(err)
+	}
+	request := authorizedRequest(http.MethodDelete, "/v1/streams/project-a/backups/"+firstBackup.ID, nil)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete first backup: %d %s", response.Code, response.Body.String())
+	}
+
+	replay := upload("deleted-operation", "must-not-create-third")
+	if replay.Code != http.StatusGone || !bytes.Contains(replay.Body.Bytes(), []byte(`"code":"operation_expired"`)) {
+		t.Fatalf("expired replay: %d %s", replay.Code, replay.Body.String())
 	}
 }
 
