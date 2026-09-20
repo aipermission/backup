@@ -6,6 +6,7 @@ services:
         VERSION: dev
     image: ghcr.io/aipermission/backup:dev
     restart: unless-stopped
+    stop_grace_period: 20s
     environment:
       AIPERMISSION_BACKUP_LISTEN_ADDR: 0.0.0.0:8080
       AIPERMISSION_BACKUP_TOKEN_FILE: /run/secrets/backup_token

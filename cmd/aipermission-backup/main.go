@@ -17,6 +17,13 @@ import (
 
 var version = "dev"
 
+const gracefulShutdownTimeout = 15 * time.Second
+
+type shutdownServer interface {
+	ListenAndServe() error
+	Shutdown(context.Context) error
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if len(os.Args) == 2 && os.Args[1] == "--healthcheck" {
@@ -56,20 +63,36 @@ func main() {
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	go func() {
-		<-shutdownCtx.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		if err := server.Shutdown(ctx); err != nil {
-			logger.Error("graceful shutdown", "error", err)
-		}
-	}()
-
 	logger.Info("backup service started", "address", cfg.ListenAddr, "version", version)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := serveUntilShutdown(shutdownCtx, server, gracefulShutdownTimeout); err != nil {
 		logger.Error("serve backup API", "error", err)
 		os.Exit(1)
 	}
+}
+
+func serveUntilShutdown(ctx context.Context, server shutdownServer, timeout time.Duration) error {
+	waitCtx, stopWaiting := context.WithCancel(context.Background())
+	defer stopWaiting()
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		select {
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			shutdownDone <- server.Shutdown(shutdownCtx)
+		case <-waitCtx.Done():
+			shutdownDone <- nil
+		}
+	}()
+
+	serveErr := server.ListenAndServe()
+	stopWaiting()
+	shutdownErr := <-shutdownDone
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		serveErr = nil
+	}
+	return errors.Join(serveErr, shutdownErr)
 }
 
 func healthcheck() error {
