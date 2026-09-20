@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -122,6 +123,42 @@ func TestIdempotentUploadReturnsCommittedBackupWithoutCreatingAnotherVersion(t *
 	}
 }
 
+func TestBackupCreationTimestampReflectsDurableUploadCompletion(t *testing.T) {
+	storage, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { storage.Close() })
+	started := time.Date(2026, time.September, 20, 10, 0, 0, 0, time.UTC)
+	finished := started.Add(5 * time.Minute)
+	current := started
+	storage.now = func() time.Time { return current }
+	reader := &clockAdvancingReader{
+		reader:  bytes.NewReader([]byte("encrypted backup")),
+		Advance: func() { current = finished },
+	}
+	backup, err := storage.CreateBackup(t.Context(), "project-a", "Project A", "install-a", reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backup.CreatedAt != formatMetadataTimestamp(finished) {
+		t.Fatalf("created_at=%q, want durable completion %q", backup.CreatedAt, formatMetadataTimestamp(finished))
+	}
+}
+
+type clockAdvancingReader struct {
+	reader  *bytes.Reader
+	Advance func()
+	didRun  bool
+}
+
+func (r *clockAdvancingReader) Read(destination []byte) (int, error) {
+	if !r.didRun {
+		r.didRun = true
+		r.Advance()
+	}
+	return r.reader.Read(destination)
+}
 func TestStorePrunesOldBackupsAndPreservesLatestVersions(t *testing.T) {
 	storage, err := Open(t.TempDir())
 	if err != nil {
@@ -423,6 +460,190 @@ func TestStoreMigratesPopulatedHistoricalMetadata(t *testing.T) {
 				t.Fatalf("historical backup row not preserved: count=%d err=%v", rowCount, err)
 			}
 		})
+	}
+}
+
+func TestStoreNormalizesHistoricalTimestampsBeforeOrdering(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := os.Chmod(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := sql.Open("sqlite", filepath.Join(dataDir, "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.Exec(`
+		CREATE TABLE backup_streams (
+			id TEXT PRIMARY KEY,
+			database_name TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			retention_keep_latest INTEGER CHECK(retention_keep_latest BETWEEN 1 AND 1000)
+		);
+		CREATE TABLE backups (
+			id TEXT PRIMARY KEY,
+			stream_id TEXT NOT NULL REFERENCES backup_streams(id),
+			source_installation_id TEXT NOT NULL,
+			filename TEXT NOT NULL,
+			size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+			sha256 TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			storage_path TEXT NOT NULL UNIQUE,
+			operation_key TEXT
+		);
+		CREATE TABLE pending_blob_deletions (
+			storage_path TEXT PRIMARY KEY,
+			queued_at TEXT NOT NULL
+		);
+		INSERT INTO backup_streams(id, database_name, created_at, updated_at)
+		VALUES ('stream-a', 'Database A', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.11Z');
+		INSERT INTO backups(id, stream_id, source_installation_id, filename, size_bytes, sha256, created_at, storage_path)
+		VALUES
+			('older-z', 'stream-a', 'install-a', 'older.aipdb', 1, 'sha', '2026-01-01T00:00:00.1Z', 'blobs/stream-a/older-z.aipdb'),
+			('newer-a', 'stream-a', 'install-a', 'newer.aipdb', 1, 'sha', '2026-01-01T00:00:00.11Z', 'blobs/stream-a/newer-a.aipdb');
+		PRAGMA user_version = 4;
+	`); err != nil {
+		metadata.Close()
+		t.Fatal(err)
+	}
+	if err := metadata.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	storage, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	if info, err := os.Stat(dataDir); err != nil || !info.IsDir() || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o700) {
+		t.Fatalf("storage directory permissions: info=%v err=%v", info, err)
+	}
+	snapshotPath := filepath.Join(dataDir, "metadata.pre-migration-v4.db")
+	if info, err := os.Stat(snapshotPath); err != nil || !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o600) {
+		t.Fatalf("migration snapshot: info=%v err=%v", info, err)
+	}
+	snapshot, err := sql.Open("sqlite", snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	var snapshotVersion int
+	if err := snapshot.QueryRow(`PRAGMA user_version`).Scan(&snapshotVersion); err != nil || snapshotVersion != 4 {
+		t.Fatalf("migration snapshot version=%d err=%v", snapshotVersion, err)
+	}
+	var snapshotTimestamp string
+	if err := snapshot.QueryRow(`SELECT created_at FROM backups WHERE id = 'older-z'`).Scan(&snapshotTimestamp); err != nil || snapshotTimestamp != "2026-01-01T00:00:00.1Z" {
+		t.Fatalf("migration snapshot timestamp=%q err=%v", snapshotTimestamp, err)
+	}
+
+	page, err := storage.ListBackups(context.Background(), "stream-a", 1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != "newer-a" || page.NextCursor == "" {
+		t.Fatalf("first page = %#v, want newer backup and cursor", page)
+	}
+	second, err := storage.ListBackups(context.Background(), "stream-a", 1, page.NextCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Items) != 1 || second.Items[0].ID != "older-z" {
+		t.Fatalf("second page = %#v, want older backup", second)
+	}
+	if page.Items[0].CreatedAt != "2026-01-01T00:00:00.110000000Z" || second.Items[0].CreatedAt != "2026-01-01T00:00:00.100000000Z" {
+		t.Fatalf("timestamps were not canonicalized: first=%q second=%q", page.Items[0].CreatedAt, second.Items[0].CreatedAt)
+	}
+	candidates, err := retentionCandidates(context.Background(), storage.db, "stream-a", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].id != "older-z" {
+		t.Fatalf("retention candidates = %#v, want older-z", candidates)
+	}
+}
+
+func TestStoreRejectsUnparseableHistoricalTimestamp(t *testing.T) {
+	dataDir := t.TempDir()
+	metadata, err := sql.Open("sqlite", filepath.Join(dataDir, "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.Exec(`
+		CREATE TABLE backup_streams (
+			id TEXT PRIMARY KEY,
+			database_name TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		INSERT INTO backup_streams(id, database_name, created_at, updated_at)
+		VALUES ('stream-a', 'Database A', 'not-a-timestamp', '2026-01-01T00:00:00Z');
+		PRAGMA user_version = 4;
+	`); err != nil {
+		metadata.Close()
+		t.Fatal(err)
+	}
+	if err := metadata.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if storage, err := Open(dataDir); err == nil {
+		storage.Close()
+		t.Fatal("expected malformed historical timestamp to reject migration")
+	}
+}
+
+func TestPreMigrationSnapshotRefreshesAStaleRollbackCopy(t *testing.T) {
+	dataDir := t.TempDir()
+	metadata, err := sql.Open("sqlite", filepath.Join(dataDir, "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer metadata.Close()
+	if _, err := metadata.Exec(`CREATE TABLE marker (value TEXT NOT NULL); INSERT INTO marker VALUES ('first'); PRAGMA user_version = 4;`); err != nil {
+		t.Fatal(err)
+	}
+	storage := &Store{db: metadata, dataDir: dataDir}
+	if err := storage.createPreMigrationSnapshot(t.Context(), 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.Exec(`UPDATE marker SET value = 'second'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.createPreMigrationSnapshot(t.Context(), 4); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := sql.Open("sqlite", filepath.Join(dataDir, "metadata.pre-migration-v4.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	var value string
+	if err := snapshot.QueryRow(`SELECT value FROM marker`).Scan(&value); err != nil || value != "second" {
+		t.Fatalf("refreshed snapshot marker=%q err=%v", value, err)
+	}
+}
+
+func TestValidateMigrationSnapshotRejectsCorruptionAndWrongVersion(t *testing.T) {
+	corruptPath := filepath.Join(t.TempDir(), "corrupt.db")
+	if err := os.WriteFile(corruptPath, []byte("not sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMigrationSnapshot(t.Context(), corruptPath, 4); err == nil {
+		t.Fatal("corrupt migration snapshot passed validation")
+	}
+	wrongVersionPath := filepath.Join(t.TempDir(), "wrong-version.db")
+	database, err := sql.Open("sqlite", wrongVersionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`CREATE TABLE marker (value TEXT); PRAGMA user_version = 3;`); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMigrationSnapshot(t.Context(), wrongVersionPath, 4); err == nil {
+		t.Fatal("wrong-version migration snapshot passed validation")
 	}
 }
 

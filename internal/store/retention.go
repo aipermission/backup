@@ -222,7 +222,7 @@ func retentionCandidatesExcluding(
 }
 
 func queueDeletionCandidates(ctx context.Context, tx *sql.Tx, streamID string, candidates []deletionCandidate, queuedAt time.Time) error {
-	queuedText := queuedAt.Format(time.RFC3339Nano)
+	queuedText := formatMetadataTimestamp(queuedAt)
 	for _, item := range candidates {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO pending_blob_deletions(storage_path, queued_at)

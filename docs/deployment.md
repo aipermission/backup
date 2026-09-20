@@ -53,4 +53,17 @@ and should be previewed first.
    `/healthz`.
 5. Verify `/v1/info` protocol compatibility before resuming uploads.
 
+Before changing an existing metadata schema, the service creates a durable
+`metadata.pre-migration-v<version>.db` snapshot beside `metadata.db`. Keep that
+file until the upgraded service has been verified, but treat it as diagnostic
+metadata rather than a complete rollback backup.
+
+To roll back, stop the service and restore the **entire service volume** from
+the snapshot taken in upgrade step 2 before starting the older image. Never
+restore `metadata.db` alone: uploads or deletions performed after migration can
+make old metadata disagree with the blob tree, and an older daemon may then
+delete valid post-migration blobs as orphans or expose stale records whose blobs
+no longer exist. If any upload, retention, prune, or delete operation occurred
+after the upgrade, a matching full-volume snapshot is mandatory.
+
 Never point two service versions at the same writable volume concurrently.

@@ -32,6 +32,20 @@ jobs:
           GOTOOLCHAIN=go1.26.6 go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
           GOTOOLCHAIN=go1.26.6 "$(go env GOPATH)/bin/govulncheck" ./...
 
+  windows:
+    name: Windows runtime checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: "1.26.6"
+          cache-dependency-path: go.sum
+      - name: Test
+        run: go test ./...
+      - name: Build
+        run: go build ./...
+
   container:
     name: Container
     runs-on: ubuntu-latest
