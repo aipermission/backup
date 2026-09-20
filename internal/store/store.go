@@ -32,7 +32,7 @@ var (
 	identifierPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
 
-const SchemaVersion = 4
+const SchemaVersion = 5
 
 type Options struct {
 	MaxStorageBytes int64
@@ -111,6 +111,9 @@ func Open(dataDir string, options ...Options) (*Store, error) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create storage directory: %w", err)
 		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("protect storage directory: %w", err)
+		}
 	}
 
 	metadataPath := filepath.Join(dataDir, "metadata.db")
@@ -159,6 +162,11 @@ func (s *Store) initialize(ctx context.Context) error {
 	}
 	if schemaVersion > SchemaVersion {
 		return fmt.Errorf("metadata schema version %d is newer than supported version %d", schemaVersion, SchemaVersion)
+	}
+	if schemaVersion > 0 && schemaVersion < SchemaVersion {
+		if err := s.createPreMigrationSnapshot(ctx, schemaVersion); err != nil {
+			return err
+		}
 	}
 	const schema = `
 PRAGMA journal_mode = WAL;
@@ -217,6 +225,11 @@ CREATE TABLE IF NOT EXISTS pending_blob_deletions (
 		}
 		if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_backups_operation_key ON backups(operation_key) WHERE operation_key IS NOT NULL`); err != nil {
 			return fmt.Errorf("index backup operation keys: %w", err)
+		}
+		if schemaVersion < 5 {
+			if err := normalizeMetadataTimestamps(ctx, tx); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
 			return fmt.Errorf("write metadata schema version: %w", err)
@@ -428,14 +441,17 @@ func (s *Store) createBackup(ctx context.Context, streamID, databaseName, source
 	}
 
 	createdAt := s.now().UTC()
-	createdText := createdAt.Format(time.RFC3339Nano)
+	createdText := formatMetadataTimestamp(createdAt)
 	filename := safeFilename(databaseName, createdAt)
 	streamDir := filepath.Join(s.blobDir, streamID)
 	if err := os.MkdirAll(streamDir, 0o700); err != nil {
 		return Backup{}, false, fmt.Errorf("create stream directory: %w", err)
 	}
+	if err := syncDirectoryDurably(s.blobDir); err != nil {
+		return Backup{}, false, fmt.Errorf("sync stream directory creation: %w", err)
+	}
 	finalPath := filepath.Join(streamDir, id+".aipdb")
-	if err := os.Rename(temporaryPath, finalPath); err != nil {
+	if err := moveFileDurably(temporaryPath, finalPath, false); err != nil {
 		return Backup{}, false, fmt.Errorf("commit uploaded backup: %w", err)
 	}
 	committed = true
@@ -445,10 +461,6 @@ func (s *Store) createBackup(ctx context.Context, streamID, databaseName, source
 			_ = os.Remove(finalPath)
 		}
 	}()
-	if err := syncDirectory(streamDir); err != nil {
-		return Backup{}, false, err
-	}
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Backup{}, false, fmt.Errorf("begin metadata transaction: %w", err)
@@ -812,18 +824,6 @@ func randomID(prefix string) (string, error) {
 		return "", fmt.Errorf("generate backup identifier: %w", err)
 	}
 	return prefix + "_" + hex.EncodeToString(raw), nil
-}
-
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open storage directory for sync: %w", err)
-	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil {
-		return fmt.Errorf("sync storage directory: %w", err)
-	}
-	return nil
 }
 
 func safeFilename(databaseName string, createdAt time.Time) string {
