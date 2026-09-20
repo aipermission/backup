@@ -16,7 +16,7 @@ import (
 	"github.com/aipermission/backup/internal/store"
 )
 
-const protocolVersion = "3"
+const protocolVersion = "4"
 
 type Config struct {
 	Token          string
@@ -63,10 +63,25 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"service":          "aipermission-backup",
 		"version":          s.config.Version,
 		"protocol_version": protocolVersion,
-		"capabilities":     []string{"immutable_upload", "idempotent_upload", "list_streams", "list_versions", "download", "prune_versions", "delete_versions", "storage_usage", "automatic_retention"},
+		"capabilities":     protocolCapabilities(),
 		"max_upload_bytes": s.config.MaxUploadBytes,
 		"storage_schema":   store.SchemaVersion,
 	})
+}
+
+func protocolCapabilities() []string {
+	return []string{
+		"immutable_upload",
+		"idempotent_upload",
+		"upload_operation_tombstones",
+		"list_streams",
+		"list_versions",
+		"download",
+		"prune_versions",
+		"delete_versions",
+		"storage_usage",
+		"automatic_retention",
+	}
 }
 
 func (s *Server) deleteBackup(w http.ResponseWriter, r *http.Request) {
@@ -171,6 +186,8 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "stream_conflict", err.Error())
 		case errors.Is(err, store.ErrOperationConflict):
 			writeError(w, http.StatusConflict, "operation_conflict", err.Error())
+		case errors.Is(err, store.ErrOperationExpired):
+			writeError(w, http.StatusGone, "operation_expired", err.Error())
 		case errors.As(err, &maxBytesError):
 			writeError(w, http.StatusRequestEntityTooLarge, "upload_too_large", "backup exceeds the configured upload limit")
 		case errors.Is(err, store.ErrInvalidInput):

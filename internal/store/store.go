@@ -29,10 +29,11 @@ var (
 	ErrCorrupt           = errors.New("stored backup checksum does not match metadata")
 	ErrQuotaExceeded     = errors.New("backup storage quota exceeded")
 	ErrOperationConflict = errors.New("backup upload operation conflicts with existing metadata")
+	ErrOperationExpired  = errors.New("backup upload operation is no longer replayable")
 	identifierPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
 
-const SchemaVersion = 5
+const SchemaVersion = 6
 
 type Options struct {
 	MaxStorageBytes int64
@@ -168,10 +169,14 @@ func (s *Store) initialize(ctx context.Context) error {
 			return err
 		}
 	}
-	const schema = `
+	if _, err := s.db.ExecContext(ctx, `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
+`); err != nil {
+		return fmt.Errorf("configure metadata database: %w", err)
+	}
+	const schema = `
 CREATE TABLE IF NOT EXISTS backup_streams (
   id TEXT PRIMARY KEY,
   database_name TEXT NOT NULL,
@@ -195,16 +200,28 @@ CREATE TABLE IF NOT EXISTS pending_blob_deletions (
   storage_path TEXT PRIMARY KEY,
   queued_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS backup_upload_operations (
+  operation_key TEXT PRIMARY KEY,
+  stream_id TEXT NOT NULL,
+  database_name TEXT NOT NULL,
+  source_installation_id TEXT NOT NULL,
+  backup_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_backup_upload_operations_backup
+  ON backup_upload_operations(backup_id);
+CREATE INDEX IF NOT EXISTS idx_backup_upload_operations_created
+  ON backup_upload_operations(created_at);
 `
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin metadata schema transaction: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("initialize metadata database: %w", err)
 	}
 	if schemaVersion < SchemaVersion {
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("begin metadata schema migration: %w", err)
-		}
-		defer tx.Rollback()
 		var retentionColumnCount int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('backup_streams') WHERE name = 'retention_keep_latest'`).Scan(&retentionColumnCount); err != nil {
 			return fmt.Errorf("inspect backup stream retention column: %w", err)
@@ -231,15 +248,47 @@ CREATE TABLE IF NOT EXISTS pending_blob_deletions (
 				return err
 			}
 		}
+		if schemaVersion < 6 {
+			if _, err := tx.ExecContext(ctx, `
+				CREATE TABLE IF NOT EXISTS backup_upload_operations (
+					operation_key TEXT PRIMARY KEY,
+					stream_id TEXT NOT NULL,
+					database_name TEXT NOT NULL,
+					source_installation_id TEXT NOT NULL,
+					backup_id TEXT NOT NULL,
+					created_at TEXT NOT NULL
+				)`); err != nil {
+				return fmt.Errorf("create backup upload operation ledger: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO backup_upload_operations (
+					operation_key, stream_id, database_name, source_installation_id, backup_id, created_at
+				)
+				SELECT b.operation_key, b.stream_id, s.database_name, b.source_installation_id, b.id, b.created_at
+				FROM backups b JOIN backup_streams s ON s.id = b.stream_id
+				WHERE b.operation_key IS NOT NULL
+				ON CONFLICT(operation_key) DO NOTHING`); err != nil {
+				return fmt.Errorf("migrate backup upload operation ledger: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_backup_upload_operations_backup ON backup_upload_operations(backup_id)`); err != nil {
+				return fmt.Errorf("index backup upload operation ledger: %w", err)
+			}
+		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
 			return fmt.Errorf("write metadata schema version: %w", err)
 		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit metadata schema migration: %w", err)
-		}
 	}
-	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_backups_operation_key ON backups(operation_key) WHERE operation_key IS NOT NULL`); err != nil {
+	if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_backups_operation_key ON backups(operation_key) WHERE operation_key IS NOT NULL`); err != nil {
 		return fmt.Errorf("ensure backup operation key index: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_backup_upload_operations_backup ON backup_upload_operations(backup_id)`); err != nil {
+		return fmt.Errorf("ensure backup upload operation ledger index: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP INDEX IF EXISTS idx_backup_upload_operations_created`); err != nil {
+		return fmt.Errorf("remove obsolete backup upload operation age index: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit metadata schema transaction: %w", err)
 	}
 	if err := s.cleanupPendingDeletions(ctx); err != nil {
 		return err
@@ -375,11 +424,14 @@ func (s *Store) createBackup(ctx context.Context, streamID, databaseName, source
 		return Backup{}, false, fmt.Errorf("%w: database name must contain 1 to 128 characters", ErrInvalidInput)
 	}
 	if operationKey != "" {
-		existing, err := s.backupByOperationKey(ctx, operationKey)
+		existing, operation, err := s.backupByOperationKey(ctx, operationKey)
 		switch {
 		case err == nil:
-			if existing.StreamID != streamID || existing.DatabaseName != databaseName || existing.SourceInstallationID != sourceInstallationID {
+			if operation.streamID != streamID || operation.databaseName != databaseName || operation.sourceInstallationID != sourceInstallationID {
 				return Backup{}, false, ErrOperationConflict
+			}
+			if existing.ID == "" {
+				return Backup{}, false, ErrOperationExpired
 			}
 			return existing, false, nil
 		case !errors.Is(err, ErrNotFound):
@@ -493,6 +545,16 @@ INSERT INTO backups(id, stream_id, source_installation_id, filename, size_bytes,
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))`, id, streamID, sourceInstallationID, filename, size, digest, createdText, relativePath, operationKey); err != nil {
 		return Backup{}, false, fmt.Errorf("store backup metadata: %w", err)
 	}
+	if operationKey != "" {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO backup_upload_operations (
+				operation_key, stream_id, database_name, source_installation_id, backup_id, created_at
+			) VALUES (?, ?, ?, ?, ?, ?)`,
+			operationKey, streamID, databaseName, sourceInstallationID, id, createdText,
+		); err != nil {
+			return Backup{}, false, fmt.Errorf("store backup upload operation: %w", err)
+		}
+	}
 	retentionDeleted, err := s.applyConfiguredRetentionTx(ctx, tx, streamID, id)
 	if err != nil {
 		return Backup{}, false, err
@@ -513,23 +575,43 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))`, id, streamID, sourceInstallation
 	}, true, nil
 }
 
-func (s *Store) backupByOperationKey(ctx context.Context, operationKey string) (Backup, error) {
+type backupUploadOperation struct {
+	streamID             string
+	databaseName         string
+	sourceInstallationID string
+}
+
+func (s *Store) backupByOperationKey(ctx context.Context, operationKey string) (Backup, backupUploadOperation, error) {
 	var backup Backup
+	var operation backupUploadOperation
+	var backupID, backupStreamID, backupDatabaseName, backupSourceID, filename, sha256Value, createdAt, storagePath sql.NullString
+	var sizeBytes sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `
-SELECT b.id, b.stream_id, s.database_name, b.source_installation_id, b.filename,
+SELECT o.stream_id, o.database_name, o.source_installation_id,
+       b.id, b.stream_id, s.database_name, b.source_installation_id, b.filename,
        b.size_bytes, b.sha256, b.created_at, b.storage_path
-FROM backups b JOIN backup_streams s ON s.id = b.stream_id
-WHERE b.operation_key = ?`, operationKey).Scan(
-		&backup.ID, &backup.StreamID, &backup.DatabaseName, &backup.SourceInstallationID,
-		&backup.Filename, &backup.SizeBytes, &backup.SHA256, &backup.CreatedAt, &backup.storagePath,
+FROM backup_upload_operations o
+LEFT JOIN backups b ON b.id = o.backup_id
+LEFT JOIN backup_streams s ON s.id = b.stream_id
+WHERE o.operation_key = ?`, operationKey).Scan(
+		&operation.streamID, &operation.databaseName, &operation.sourceInstallationID,
+		&backupID, &backupStreamID, &backupDatabaseName, &backupSourceID, &filename,
+		&sizeBytes, &sha256Value, &createdAt, &storagePath,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Backup{}, ErrNotFound
+		return Backup{}, backupUploadOperation{}, ErrNotFound
 	}
 	if err != nil {
-		return Backup{}, fmt.Errorf("read backup operation: %w", err)
+		return Backup{}, backupUploadOperation{}, fmt.Errorf("read backup operation: %w", err)
 	}
-	return backup, nil
+	if backupID.Valid {
+		backup = Backup{
+			ID: backupID.String, StreamID: backupStreamID.String, DatabaseName: backupDatabaseName.String,
+			SourceInstallationID: backupSourceID.String, Filename: filename.String, SizeBytes: sizeBytes.Int64,
+			SHA256: sha256Value.String, CreatedAt: createdAt.String, storagePath: storagePath.String,
+		}
+	}
+	return backup, operation, nil
 }
 
 func (s *Store) ListStreams(ctx context.Context, limit int, cursor string) (Page[Stream], error) {
