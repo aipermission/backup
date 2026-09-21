@@ -43,7 +43,7 @@ GET /v1/storage
 ```
 
 Returns the stored byte count, backup and stream counts, pending blob cleanup
-count, and configured quota/remaining bytes when
+count, durable upload-operation count and limit, and configured quota/remaining bytes when
 `AIPERMISSION_BACKUP_MAX_STORAGE_BYTES` is enabled. Usage failures return an
 error response; clients must not interpret a failed check as zero usage.
 
@@ -53,6 +53,13 @@ For streams with automatic retention, this check uses projected post-retention
 usage: versions that would be pruned by the same successful upload count as
 reclaimable space. The service still preserves the existing versions unless
 the new immutable version and its metadata commit successfully.
+
+Upload-operation identities are durable tombstones and are not removed by
+backup retention. At `upload_operation_limit`, the service preserves replay
+and `410 operation_expired` behavior for known IDs but rejects a new ID with
+`507 operation_ledger_full` before reading its request body. Operators can
+raise `AIPERMISSION_BACKUP_MAX_UPLOAD_OPERATIONS` after checking persistent
+volume capacity; deleting tombstones is intentionally unsupported.
 
 ## Upload An Immutable Version
 

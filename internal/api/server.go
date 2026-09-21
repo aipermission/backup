@@ -188,6 +188,8 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "operation_conflict", err.Error())
 		case errors.Is(err, store.ErrOperationExpired):
 			writeError(w, http.StatusGone, "operation_expired", err.Error())
+		case errors.Is(err, store.ErrOperationCapacity):
+			writeError(w, http.StatusInsufficientStorage, "operation_ledger_full", err.Error())
 		case errors.As(err, &maxBytesError):
 			writeError(w, http.StatusRequestEntityTooLarge, "upload_too_large", "backup exceeds the configured upload limit")
 		case errors.Is(err, store.ErrInvalidInput):

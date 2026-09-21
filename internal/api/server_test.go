@@ -213,6 +213,24 @@ func TestUploadOperationReturnsGoneAfterBackupDeletion(t *testing.T) {
 	}
 }
 
+func TestUploadOperationCapacityReturnsStableFailure(t *testing.T) {
+	storage, err := store.Open(t.TempDir(), store.Options{MaxUploadOperations: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { storage.Close() })
+	server := New(Config{Token: testToken, MaxUploadBytes: 1024, Version: "test"}, storage, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	first := uploadTestBackup(t, server, "first")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first upload: %d %s", first.Code, first.Body.String())
+	}
+	second := uploadTestBackup(t, server, "second")
+	if second.Code != http.StatusInsufficientStorage || !bytes.Contains(second.Body.Bytes(), []byte(`"code":"operation_ledger_full"`)) {
+		t.Fatalf("capacity rejection: %d %s", second.Code, second.Body.String())
+	}
+}
+
 func TestPruneRejectsUnsafeRetention(t *testing.T) {
 	server := newTestServer(t, 1024)
 	request := authorizedRequest(http.MethodPost, "/v1/streams/project-a/prune", bytes.NewBufferString(`{"keep_latest":0}`))
@@ -307,7 +325,10 @@ func TestAutomaticRetentionPreviewAndStorageUsage(t *testing.T) {
 	request = authorizedRequest(http.MethodGet, "/v1/storage", nil)
 	response = httptest.NewRecorder()
 	server.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"quota_enabled":true`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"backup_count":2`)) {
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"quota_enabled":true`)) ||
+		!bytes.Contains(response.Body.Bytes(), []byte(`"backup_count":2`)) ||
+		!bytes.Contains(response.Body.Bytes(), []byte(`"upload_operations":4`)) ||
+		!bytes.Contains(response.Body.Bytes(), []byte(`"upload_operation_limit":1000000`)) {
 		t.Fatalf("storage usage: %d %s", response.Code, response.Body.String())
 	}
 }

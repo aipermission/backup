@@ -44,3 +44,25 @@ func TestLoadStorageQuota(t *testing.T) {
 		t.Fatalf("max storage bytes = %d", cfg.MaxStorageBytes)
 	}
 }
+
+func TestLoadUploadOperationCapacity(t *testing.T) {
+	t.Setenv("AIPERMISSION_BACKUP_TOKEN_FILE", "")
+	t.Setenv("AIPERMISSION_BACKUP_TOKEN", "test-token-with-at-least-thirty-two-characters")
+	t.Setenv("AIPERMISSION_BACKUP_MAX_UPLOAD_OPERATIONS", "1234")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxUploadOperations != 1234 {
+		t.Fatalf("max upload operations = %d", cfg.MaxUploadOperations)
+	}
+}
+
+func TestLoadRejectsInvalidUploadOperationCapacity(t *testing.T) {
+	t.Setenv("AIPERMISSION_BACKUP_TOKEN_FILE", "")
+	t.Setenv("AIPERMISSION_BACKUP_TOKEN", "test-token-with-at-least-thirty-two-characters")
+	t.Setenv("AIPERMISSION_BACKUP_MAX_UPLOAD_OPERATIONS", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected zero upload operation capacity to be rejected")
+	}
+}

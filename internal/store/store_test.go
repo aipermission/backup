@@ -282,6 +282,49 @@ func TestOpenRetainsOldUploadTombstones(t *testing.T) {
 	}
 }
 
+func TestUploadOperationCapacityRejectsOnlyNewIdentities(t *testing.T) {
+	storage, err := Open(t.TempDir(), Options{MaxUploadOperations: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	ctx := context.Background()
+	first, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "operation-first", bytes.NewReader([]byte("first")))
+	if err != nil || !created {
+		t.Fatalf("first upload: created=%v err=%v", created, err)
+	}
+	second, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "operation-second", bytes.NewReader([]byte("second")))
+	if err != nil || !created {
+		t.Fatalf("second upload: created=%v err=%v", created, err)
+	}
+
+	replayed, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "operation-first", bytes.NewReader([]byte("ignored")))
+	if err != nil || created || replayed.ID != first.ID {
+		t.Fatalf("existing replay at capacity: backup=%#v created=%v err=%v", replayed, created, err)
+	}
+	if _, err := storage.DeleteBackups(ctx, "project-a", []string{first.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "operation-first", bytes.NewReader([]byte("ignored"))); !errors.Is(err, ErrOperationExpired) || created {
+		t.Fatalf("expired replay at capacity: created=%v err=%v", created, err)
+	}
+
+	body := bytes.NewReader([]byte("must-not-be-consumed"))
+	if _, created, err := storage.CreateBackupIdempotent(ctx, "project-a", "Project A", "install-a", "operation-third", body); !errors.Is(err, ErrOperationCapacity) || created {
+		t.Fatalf("new operation at capacity: created=%v err=%v", created, err)
+	}
+	if body.Len() != len("must-not-be-consumed") {
+		t.Fatalf("capacity rejection consumed %d body bytes", len("must-not-be-consumed")-body.Len())
+	}
+	usage, err := storage.StorageUsage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.UploadOperations != 2 || usage.UploadOpLimit != 2 || second.ID == "" {
+		t.Fatalf("unexpected operation usage: %#v", usage)
+	}
+}
+
 func TestStorePrunesOldBackupsAndPreservesLatestVersions(t *testing.T) {
 	storage, err := Open(t.TempDir())
 	if err != nil {

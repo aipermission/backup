@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/aipermission/backup/internal/store"
 )
 
 const (
@@ -15,18 +17,20 @@ const (
 )
 
 type Config struct {
-	ListenAddr      string
-	DataDir         string
-	Token           string
-	MaxUploadBytes  int64
-	MaxStorageBytes int64
+	ListenAddr          string
+	DataDir             string
+	Token               string
+	MaxUploadBytes      int64
+	MaxStorageBytes     int64
+	MaxUploadOperations int64
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		ListenAddr:     envOrDefault("AIPERMISSION_BACKUP_LISTEN_ADDR", defaultListenAddr),
-		DataDir:        envOrDefault("AIPERMISSION_BACKUP_DATA_DIR", defaultDataDir),
-		MaxUploadBytes: defaultMaxUploadBytes,
+		ListenAddr:          envOrDefault("AIPERMISSION_BACKUP_LISTEN_ADDR", defaultListenAddr),
+		DataDir:             envOrDefault("AIPERMISSION_BACKUP_DATA_DIR", defaultDataDir),
+		MaxUploadBytes:      defaultMaxUploadBytes,
+		MaxUploadOperations: store.DefaultMaxUploadOperations,
 	}
 
 	if raw := strings.TrimSpace(os.Getenv("AIPERMISSION_BACKUP_MAX_UPLOAD_BYTES")); raw != "" {
@@ -43,6 +47,14 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("AIPERMISSION_BACKUP_MAX_STORAGE_BYTES must be a positive integer")
 		}
 		cfg.MaxStorageBytes = value
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("AIPERMISSION_BACKUP_MAX_UPLOAD_OPERATIONS")); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value < 1 {
+			return Config{}, fmt.Errorf("AIPERMISSION_BACKUP_MAX_UPLOAD_OPERATIONS must be a positive integer")
+		}
+		cfg.MaxUploadOperations = value
 	}
 
 	token, err := loadToken()

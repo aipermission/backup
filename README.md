@@ -105,6 +105,7 @@ contains the database password or decrypted database content.
 | `AIPERMISSION_BACKUP_TOKEN` | none | Token fallback; minimum 32 characters |
 | `AIPERMISSION_BACKUP_MAX_UPLOAD_BYTES` | `2147483648` | Maximum request body size |
 | `AIPERMISSION_BACKUP_MAX_STORAGE_BYTES` | unlimited | Optional total stored-backup quota in bytes |
+| `AIPERMISSION_BACKUP_MAX_UPLOAD_OPERATIONS` | `1000000` | Maximum durable upload-operation identities |
 
 Exactly one token source is required. The token file takes precedence.
 When a storage quota is configured, uploads that cannot fit are rejected before
@@ -114,6 +115,12 @@ release by pruning older versions. Existing versions remain untouched when the
 new upload or its metadata transaction fails. Storage usage and remaining quota
 are available through the authenticated protocol; a failed usage request is
 never represented as an empty or healthy store.
+
+Upload operation identities are retained permanently so a delayed retry can
+never reuse an expired identity and create a duplicate backup. The configured
+operation limit bounds this durable ledger. Once full, existing operation IDs
+keep their replay or `410 operation_expired` behavior, while new IDs are
+rejected with `507 operation_ledger_full` before their request body is read.
 
 ## Protocol
 

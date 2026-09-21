@@ -16,6 +16,8 @@ type StorageUsage struct {
 	BackupCount      int64  `json:"backup_count"`
 	StreamCount      int64  `json:"stream_count"`
 	PendingDeletions int64  `json:"pending_deletions"`
+	UploadOperations int64  `json:"upload_operations"`
+	UploadOpLimit    int64  `json:"upload_operation_limit"`
 }
 
 func (s *Store) StorageUsage(ctx context.Context) (StorageUsage, error) {
@@ -25,8 +27,9 @@ func (s *Store) StorageUsage(ctx context.Context) (StorageUsage, error) {
 			COALESCE((SELECT SUM(size_bytes) FROM backups), 0),
 			(SELECT COUNT(*) FROM backups),
 			(SELECT COUNT(*) FROM backup_streams),
-			(SELECT COUNT(*) FROM pending_blob_deletions)
-	`).Scan(&usage.UsedBytes, &usage.BackupCount, &usage.StreamCount, &usage.PendingDeletions)
+			(SELECT COUNT(*) FROM pending_blob_deletions),
+			(SELECT COUNT(*) FROM backup_upload_operations)
+	`).Scan(&usage.UsedBytes, &usage.BackupCount, &usage.StreamCount, &usage.PendingDeletions, &usage.UploadOperations)
 	if err != nil {
 		return StorageUsage{}, fmt.Errorf("read backup storage usage: %w", err)
 	}
@@ -39,6 +42,7 @@ func (s *Store) StorageUsage(ctx context.Context) (StorageUsage, error) {
 		usage.QuotaBytes = s.maxStorageBytes
 		usage.RemainingBytes = &remaining
 	}
+	usage.UploadOpLimit = s.maxUploadOps
 	return usage, nil
 }
 
