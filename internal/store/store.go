@@ -462,12 +462,9 @@ func (s *Store) createBackup(ctx context.Context, streamID, databaseName, source
 		return Backup{}, false, fmt.Errorf("create temporary upload: %w", err)
 	}
 	temporaryPath := temporary.Name()
-	committed := false
 	defer func() {
-		temporary.Close()
-		if !committed {
-			_ = os.Remove(temporaryPath)
-		}
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
 	}()
 
 	hash := sha256.New()
@@ -506,7 +503,6 @@ func (s *Store) createBackup(ctx context.Context, streamID, databaseName, source
 	if err := moveFileDurably(temporaryPath, finalPath, false); err != nil {
 		return Backup{}, false, fmt.Errorf("commit uploaded backup: %w", err)
 	}
-	committed = true
 	removeFinal := true
 	defer func() {
 		if removeFinal {

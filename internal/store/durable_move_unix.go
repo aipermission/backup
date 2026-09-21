@@ -3,37 +3,68 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
 
 func moveFileDurably(source, target string, replace bool) error {
+	return moveFileDurablyWith(
+		source,
+		target,
+		replace,
+		os.Rename,
+		os.Link,
+		os.Remove,
+		syncDirectoryDurably,
+	)
+}
+
+func moveFileDurablyWith(
+	source, target string,
+	replace bool,
+	renameFile, linkFile func(string, string) error,
+	removeFile func(string) error,
+	syncDirectory func(string) error,
+) error {
 	if replace {
-		if err := os.Rename(source, target); err != nil {
+		if err := renameFile(source, target); err != nil {
 			return err
 		}
-	} else {
-		if err := os.Link(source, target); err != nil {
+		if err := syncDirectory(filepath.Dir(target)); err != nil {
 			return err
 		}
-		if err := syncDirectoryDurably(filepath.Dir(target)); err != nil {
-			_ = os.Remove(target)
-			return err
-		}
-		if err := os.Remove(source); err != nil {
-			if os.Remove(target) == nil {
-				_ = syncDirectoryDurably(filepath.Dir(target))
+		if sourceDirectory := filepath.Dir(source); sourceDirectory != filepath.Dir(target) {
+			if err := syncDirectory(sourceDirectory); err != nil {
+				return err
 			}
-			return err
 		}
+		return nil
 	}
-	if err := syncDirectoryDurably(filepath.Dir(target)); err != nil {
+
+	if err := linkFile(source, target); err != nil {
 		return err
 	}
-	if sourceDirectory := filepath.Dir(source); sourceDirectory != filepath.Dir(target) {
-		if err := syncDirectoryDurably(sourceDirectory); err != nil {
-			return err
+	targetDirectory := filepath.Dir(target)
+	if err := syncDirectory(targetDirectory); err != nil {
+		cleanupErr := removeFile(target)
+		if cleanupErr == nil {
+			cleanupErr = syncDirectory(targetDirectory)
+		}
+		if cleanupErr != nil {
+			return errors.Join(err, fmt.Errorf("roll back unpublished target: %w", cleanupErr))
+		}
+		return err
+	}
+
+	// The target is committed once its directory entry is durable. Source cleanup
+	// cannot safely turn that success into a failure because metadata rollback
+	// would then leave the already-published target orphaned. The caller retries
+	// removal, and startup cleanup handles a source entry resurrected by a crash.
+	if err := removeFile(source); err == nil {
+		if sourceDirectory := filepath.Dir(source); sourceDirectory != targetDirectory {
+			_ = syncDirectory(sourceDirectory)
 		}
 	}
 	return nil
