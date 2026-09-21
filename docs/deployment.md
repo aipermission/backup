@@ -43,6 +43,12 @@ set plus one maximum-size incoming snapshot. Enabling `apply_now` can reclaim
 existing old versions immediately, but it is an explicit destructive operation
 and should be previewed first.
 
+`AIPERMISSION_BACKUP_MAX_UPLOAD_OPERATIONS` bounds the durable idempotency
+ledger and defaults to 1,000,000 entries. Tombstones are deliberately never
+aged out because reuse could duplicate an upload after a lost response. At the
+limit, increase the configured bound after checking disk capacity; existing
+operation identities remain replayable while new identities fail closed.
+
 ## Upgrade
 
 1. Stop new uploads from AIPermission.

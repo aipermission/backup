@@ -30,13 +30,18 @@ var (
 	ErrQuotaExceeded     = errors.New("backup storage quota exceeded")
 	ErrOperationConflict = errors.New("backup upload operation conflicts with existing metadata")
 	ErrOperationExpired  = errors.New("backup upload operation is no longer replayable")
+	ErrOperationCapacity = errors.New("backup upload operation ledger is full")
 	identifierPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
 
-const SchemaVersion = 6
+const (
+	SchemaVersion              = 6
+	DefaultMaxUploadOperations = int64(1_000_000)
+)
 
 type Options struct {
-	MaxStorageBytes int64
+	MaxStorageBytes     int64
+	MaxUploadOperations int64
 }
 
 type Store struct {
@@ -46,6 +51,7 @@ type Store struct {
 	tempDir         string
 	now             func() time.Time
 	maxStorageBytes int64
+	maxUploadOps    int64
 	mutationMu      sync.Mutex
 }
 
@@ -131,9 +137,16 @@ func Open(dataDir string, options ...Options) (*Store, error) {
 		db.Close()
 		return nil, errors.New("maximum storage bytes cannot be negative")
 	}
+	if opts.MaxUploadOperations < 0 {
+		db.Close()
+		return nil, errors.New("maximum upload operations cannot be negative")
+	}
+	if opts.MaxUploadOperations == 0 {
+		opts.MaxUploadOperations = DefaultMaxUploadOperations
+	}
 	store := &Store{
 		db: db, dataDir: dataDir, blobDir: blobDir, tempDir: tempDir,
-		now: time.Now, maxStorageBytes: opts.MaxStorageBytes,
+		now: time.Now, maxStorageBytes: opts.MaxStorageBytes, maxUploadOps: opts.MaxUploadOperations,
 	}
 	if err := store.initialize(context.Background()); err != nil {
 		db.Close()
@@ -437,6 +450,9 @@ func (s *Store) createBackup(ctx context.Context, streamID, databaseName, source
 		case !errors.Is(err, ErrNotFound):
 			return Backup{}, false, err
 		}
+		if err := s.ensureUploadOperationCapacity(ctx); err != nil {
+			return Backup{}, false, err
+		}
 	}
 	if err := s.cleanupPendingDeletions(ctx); err != nil {
 		return Backup{}, false, err
@@ -569,6 +585,17 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))`, id, streamID, sourceInstallation
 		SizeBytes: size, SHA256: digest, CreatedAt: createdText,
 		RetentionDeletedCount: retentionDeleted,
 	}, true, nil
+}
+
+func (s *Store) ensureUploadOperationCapacity(ctx context.Context) error {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM backup_upload_operations`).Scan(&count); err != nil {
+		return fmt.Errorf("read backup upload operation capacity: %w", err)
+	}
+	if count >= s.maxUploadOps {
+		return ErrOperationCapacity
+	}
+	return nil
 }
 
 type backupUploadOperation struct {
