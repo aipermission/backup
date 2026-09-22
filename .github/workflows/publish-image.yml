@@ -10,29 +10,51 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: publish-container-image
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    name: Publish GHCR image
+  verify:
+    name: Verify tagged source
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: "1.26.6"
+          cache-dependency-path: go.sum
+      - name: Verify tag source is on main
+        run: |
+          set -Eeuo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          test "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" = "${GITHUB_SHA}"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
+      - name: Verify exact tagged source
+        run: make check
+
+  publish:
+    name: Publish GHCR image
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build exact candidate image
+        run: |
+          set -Eeuo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          docker build --build-arg "VERSION=${version}" --tag aipermission-backup:release-candidate .
+      - name: Scan exact candidate image
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.63.0@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 \
+            image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed aipermission-backup:release-candidate
       - name: Log in to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Set up Docker Buildx
-        run: docker buildx create --use
-      - name: Publish image
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          tags=(
-            --tag "ghcr.io/aipermission/backup:${GITHUB_REF_NAME}"
-            --tag "ghcr.io/aipermission/backup:${version}"
-          )
-          if [[ "${version}" != *-* ]]; then
-            tags+=(--tag ghcr.io/aipermission/backup:latest)
-          fi
-          docker buildx build \
-            --platform linux/amd64 \
-            --build-arg "VERSION=${version}" \
-            "${tags[@]}" \
-            --push \
-            .
+      - name: Publish immutable release tags
+        run: bash scripts/publish-image.sh aipermission-backup:release-candidate

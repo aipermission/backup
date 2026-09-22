@@ -54,5 +54,4 @@ jobs:
       - name: Build image
         run: docker build --build-arg VERSION=ci -t aipermission-backup:ci .
       - name: Scan image
-        continue-on-error: true
-        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.63.0@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 image --severity HIGH,CRITICAL --ignore-unfixed aipermission-backup:ci
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.63.0@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed aipermission-backup:ci
