@@ -2,7 +2,7 @@
 
 All notable changes to AIPermission Backup are documented in this file.
 
-## [Unreleased]
+## [0.4.0] - 2026-09-28
 
 ### Changed
 
@@ -10,11 +10,19 @@ All notable changes to AIPermission Backup are documented in this file.
   release Compose example to the matching `0.4.0` service image.
 - Expired upload operation identities now remain as durable tombstones, so a
   delayed retry cannot create a new backup after the original version is gone.
+- Bound durable upload-operation storage with an explicit capacity limit;
+  existing operation retries remain available when the ledger is full.
+- Drain active HTTP requests during graceful shutdown and strengthen atomic
+  blob publication and restart recovery.
+- Split storage responsibilities into focused modules and enforce formatting,
+  size budgets, coverage, race checks, and release image verification.
 
 ### Security
 
 - Historical metadata migrations now preserve canonical timestamps and run
   under restrictive directory permissions before snapshots are created.
+- Verify tagged source and scan the exact candidate image before publishing
+  immutable registry tags.
 
 ## [0.3.0] - 2026-09-14
 
